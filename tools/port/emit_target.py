@@ -155,8 +155,12 @@ def render(
             lines.append(f'#define {macro} "{value}"  /* {source} */')
         else:
             lines.append(f"#define {macro} 0x{value:08x}ULL  /* {source} */")
-    lines.append("")
-    lines.append('#include "p0_fingerprint.h"')
+    # The P0 table is *not* included here, and the reason is the include order rather than taste:
+    # `measured.h` is reached from `offset.h`, which is the first thing `common.h` includes, so the
+    # table's `uint16_t`/`uint64_t` would be expanded before `<stdint.h>`. The repository's convention
+    # is `P0_FINGERPRINT_HEADER` in `target.h` and `#include P0_FINGERPRINT_HEADER` in `pipe.c` after the
+    # standard headers, which is where the table is used; the `--fingerprint` check below still makes
+    # sure it exists, so a header cannot be written against a table that was never generated.
     return "\n".join(lines)
 
 
@@ -280,7 +284,8 @@ def self_test() -> int:
         ("every required macro renders", all(f"#define {macro}" in rendered for macro in REQUIRED)),
         ("the event id is not printed as a pointer",
          "#define SLIDE_TRACEFS_EVENT_ID 0x" not in rendered),
-        ("the P0 table is included", '#include "p0_fingerprint.h"' in rendered),
+        ("the P0 table is left to `pipe.c`, which includes it after `<stdint.h>`",
+         '#include "p0_fingerprint.h"' not in rendered),
         ("a missing macro is refused", _refuses_missing()),
         ("an unaligned base is refused", _refuses_base()),
         ("a duplicate measurement is refused", _refuses_duplicate()),

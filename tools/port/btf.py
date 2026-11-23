@@ -30,11 +30,16 @@ import argparse
 import json
 import struct
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
 BTF_MAGIC = 0xEB9F
 BTF_VERSION = 1
+
+# Anonymous aggregates are expanded recursively, so a cyclic or truncated table could otherwise send
+# the walk round forever rather than fail; a kernel layout never nests this deep.
+MAX_ANON_DEPTH = 8
 
 KIND_INT = 1
 KIND_PTR = 2
@@ -69,12 +74,15 @@ KIND_NAMES = {
 # whole of what makes iteration correct: a wrong size here does not fail loudly, it silently reads the
 # next type from the middle of this one.
 PER_ELEMENT = {
-    KIND_STRUCT: 12, KIND_UNION: 12, KIND_ENUM: 8, KIND_FUNC_PROTO: 8, KIND_VAR: 4,
-    KIND_DATASEC: 12, KIND_DECL_TAG: 4, KIND_ENUM64: 12,
+    KIND_STRUCT: 12, KIND_UNION: 12, KIND_ENUM: 8, KIND_FUNC_PROTO: 8,
+    KIND_DATASEC: 12, KIND_ENUM64: 12,
 }
 # Kinds whose payload is a fixed size rather than `vlen` elements: an ARRAY is three words whatever
-# its `vlen` says, and an INT is always one encoding word - never `vlen` of them.
-FIXED_BYTES = {KIND_ARRAY: 12, KIND_INT: 4}
+# its `vlen` says, an INT is always one encoding word, a VAR is one linkage word and a DECL_TAG one
+# component index - both of those with `vlen == 0`. A VAR treated as `4 * vlen` consumes nothing, and
+# the next record is then read from inside this one: the walk continues for a while, then reports a
+# "kind 0" that is really the middle of a type it had already passed.
+FIXED_BYTES = {KIND_ARRAY: 12, KIND_INT: 4, KIND_VAR: 4, KIND_DECL_TAG: 4}
 
 
 @dataclass
@@ -83,6 +91,11 @@ class Member:
     type_id: int
     bit_offset: int
     bitfield_bits: int = 0
+    # The anonymous aggregates crossed to reach this member. A `struct page` field such as
+    # `compound_head` lives inside an unnamed union, and BTF records that as a member named "" whose
+    # type is the union - so a reader that only walks the direct members sees the union and never the
+    # field the target header carries an offset for.
+    path: tuple[str, ...] = ()
 
     @property
     def byte_offset(self) -> int | None:
@@ -214,15 +227,51 @@ class Btf:
         return parsed
 
     def members(self, name: str) -> list[Member]:
-        """Members of the first STRUCT/UNION called [name].
+        """Members of the first STRUCT/UNION called [name], with anonymous aggregates expanded.
 
         Duplicates are a real thing in kernel BTF (two translation units can emit the same tag), so
-        the caller is told rather than silently given one of them.
+        the caller is told rather than silently given one of them. Expansion is unconditional because
+        the alternative is worse than useless here: `page.type` does not exist as a direct member, so a
+        header carrying `STRUCT_PAGE_TYPE_OFF` could only ever be checked against a union whose offset
+        is not the field's.
         """
         matches = self._by_name.get(name, [])
         if not matches:
             raise KeyError(name)
-        return matches[0].members
+        return list(self._expand(matches[0].members, 0, (), 0))
+
+    def size(self, name: str) -> int:
+        """`sizeof` the blob records for [name], which is a size the header may carry instead of an offset."""
+        matches = self._by_name.get(name, [])
+        if not matches:
+            raise KeyError(name)
+        return matches[0].size_or_type
+
+    def _expand(
+        self, members: list[Member], base_bits: int, path: tuple[str, ...], depth: int
+    ) -> Iterator[Member]:
+        """Flatten anonymous struct/union members, which is where half of `struct page` lives."""
+        if depth > MAX_ANON_DEPTH:
+            raise ValueError(
+                f"anonymous aggregates nested more than {MAX_ANON_DEPTH} deep at {'.'.join(path) or '?'}: "
+                "that is a malformed or cyclic type table, not a kernel layout"
+            )
+        for member in members:
+            absolute = base_bits + member.bit_offset
+            nested = self._anonymous_aggregate(member)
+            if nested is None:
+                yield Member(member.name, member.type_id, absolute, member.bitfield_bits, path)
+            else:
+                yield from self._expand(nested.members, absolute, path + ("<anonymous>",), depth + 1)
+
+    def _anonymous_aggregate(self, member: Member) -> BtfType | None:
+        """The struct/union a nameless, non-bitfield member is, if it is one."""
+        if member.name or member.bitfield_bits:
+            return None
+        if not 0 <= member.type_id < len(self.types):
+            return None
+        nested = self.types[member.type_id]
+        return nested if nested.kind in (KIND_STRUCT, KIND_UNION) else None
 
     def struct_names(self) -> list[str]:
         return sorted(self._by_name)
@@ -230,7 +279,7 @@ class Btf:
 
 def describe(btf: Btf, name: str) -> dict:
     """Every member of [name], with the byte offsets a target header would use."""
-    result: dict = {"struct": name, "members": [], "unusable": []}
+    result: dict = {"struct": name, "size": btf.size(name), "members": [], "unusable": []}
     for member in btf.members(name):
         byte_offset = member.byte_offset
         entry = {
@@ -238,6 +287,7 @@ def describe(btf: Btf, name: str) -> dict:
             "bit_offset": member.bit_offset,
             "byte_offset": byte_offset,
             "bitfield_bits": member.bitfield_bits,
+            "path": list(member.path),
         }
         if byte_offset is None:
             result["unusable"].append(entry)
@@ -297,9 +347,11 @@ def self_test() -> int:
             blob += name.encode() + b"\x00"
         return bytes(blob)
 
-    strings = string_section(["", "task_struct", "cred", "real_cred", "flags", "usage"])
+    strings = string_section(["", "task_struct", "cred", "real_cred", "flags", "usage", "after_var",
+                              "page_like"])
     # Offsets into that section, written out rather than searched for, so the test says what it means.
-    off = {"task_struct": 1, "cred": 13, "real_cred": 18, "flags": 28, "usage": 34}
+    off = {"task_struct": 1, "cred": 13, "real_cred": 18, "flags": 28, "usage": 34, "after_var": 40,
+           "page_like": 50}
 
     def member(name_off: int, type_id: int, raw_offset: int) -> bytes:
         return struct.pack("<III", name_off, type_id, raw_offset)
@@ -309,9 +361,21 @@ def self_test() -> int:
     types += struct.pack("<III", off["task_struct"], (KIND_STRUCT << 24) | (2 << 0), 0x1000)
     types += member(off["cred"], 1, 0x790 * 8)
     types += member(off["real_cred"], 1, 0x798 * 8)
+    # Two records whose payload is one word and whose `vlen` is zero: sized by `vlen` they take nothing
+    # and every type after them is read from the wrong place.
+    types += struct.pack("<III", off["task_struct"], (KIND_VAR << 24) | 0, 1) + struct.pack("<I", 0)
+    types += struct.pack("<III", off["usage"], (KIND_DECL_TAG << 24) | 0, 1) + struct.pack("<i", -1)
     # A kind_flag struct: low 24 bits are the offset, the top 8 are the bitfield width.
     types += struct.pack("<III", 0, (1 << 31) | (KIND_STRUCT << 24) | 1, 8)
     types += member(off["flags"], 1, (0x10 * 8) | (3 << 24))
+    types += struct.pack("<III", off["after_var"], (KIND_STRUCT << 24) | 1, 0x100)
+    types += member(off["usage"], 1, 0x18 * 8)
+    # An anonymous union inside a struct - `struct page`'s shape - whose field is only reachable by
+    # expanding the unnamed member. Type 7 is this union, and type 8 the struct that holds it.
+    types += struct.pack("<III", 0, (KIND_UNION << 24) | 1, 8) + member(off["usage"], 1, 0)
+    types += struct.pack("<III", off["page_like"], (KIND_STRUCT << 24) | 2, 0x40)
+    types += member(off["flags"], 1, 0)
+    types += member(0, 7, 0x20 * 8)
 
     header_len = 24
     header = struct.pack(
@@ -324,10 +388,16 @@ def self_test() -> int:
     btf = Btf(blob)
     creds = {member.name: member.byte_offset for member in btf.members("task_struct")}
     flagged = {member.name: member.byte_offset for member in btf.members("")}
+    after = {member.name: member.byte_offset for member in btf.members("after_var")}
+    page_like = {member.name: member.byte_offset for member in btf.members("page_like")}
     results = [
         ("a plain member keeps its byte offset", creds.get("cred") == 0x790),
         ("a second member keeps its own", creds.get("real_cred") == 0x798),
         ("a kind_flag member drops the width bits", flagged.get("flags") == 0x10),
+        ("a VAR and a DECL_TAG are sized without `vlen`", after.get("usage") == 0x18),
+        ("every record is read, so no payload was mis-sized", len(btf.types) == 9),
+        ("a field inside an anonymous union gets its absolute offset", page_like.get("usage") == 0x20),
+        ("a struct's size is the header's size", btf.size("page_like") == 0x40),
         ("a found blob is the whole blob", find_blob(b"\x00" * 64 + blob + b"\x00" * 64) == (64, 64 + len(blob))),
     ]
 

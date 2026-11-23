@@ -56,6 +56,18 @@ class ImageHeader:
     text_offset: int
     image_size: int
     flags: int
+    stored: int = 0
+
+    @property
+    def bss(self) -> int:
+        """Bytes the header reserves but the file does not hold.
+
+        `image_size` is `_end - _text`, so it counts `.bss`, which is not stored anywhere: on a stock
+        boot partition the kernel's stored length is `_edata - _text` and this difference is exactly
+        the zero-filled tail the linker will recreate at boot. It is *expected* here - it is not the
+        truncation the header check is looking for - which is why it is reported rather than refused.
+        """
+        return self.image_size - self.stored if self.stored else 0
 
 
 def lz4_decompress(data: bytes) -> bytes:
@@ -115,21 +127,27 @@ def boot_kernel(boot: bytes) -> bytes:
 def image_header(kernel: bytes) -> ImageHeader:
     """The three fields of the ARM64 Image header a port reads.
 
-    `image_size` is checked rather than trusted: a header claiming more bytes than the file holds is
-    a truncated kernel, and every offset measured from it would be from the wrong kernel.
+    `image_size` is checked in one direction only, and the reason is worth writing down because the
+    opposite check looks obviously right: `image_size` is `_end - _text`, so it includes `.bss`, and
+    `.bss` is not stored. A kernel read out of a boot partition is therefore *always* shorter than its
+    header says - on this device by 2,749,952 bytes - and refusing that would refuse every honest
+    Image while the actual failure it is meant to catch, a file longer than the header describes, is
+    the one that means junk or a second payload was appended. The shortfall is reported as `bss`, and
+    only a file that is *longer* than its own header is an error.
     """
     if len(kernel) < IMAGE_FLAGS_OFFSET + 8:
         raise ValueError("not an ARM64 Image: shorter than its own header")
     text_offset, image_size, flags = struct.unpack_from("<QQQ", kernel, IMAGE_TEXT_OFFSET)
-    if image_size > len(kernel):
+    if image_size < len(kernel):
         raise ValueError(
-            f"the Image header says {image_size} bytes but the file holds {len(kernel)}"
+            f"the Image header says {image_size} bytes but the file holds {len(kernel)}: the header "
+            "describes a smaller kernel than this, so one of the two is not the kernel it claims"
         )
     # The Image itself starts with a branch instruction, not a magic number, so the only structural
     # check available is that the documented fields are self-consistent.
     if flags & 0xFFFF0000:
         raise ValueError(f"Image flags 0x{flags:x} carry reserved bits: not an ARM64 Image")
-    return ImageHeader(text_offset=text_offset, image_size=image_size, flags=flags)
+    return ImageHeader(text_offset=text_offset, image_size=image_size, flags=flags, stored=len(kernel))
 
 
 def physical_load(kernel: bytes) -> int:
@@ -178,6 +196,11 @@ def main() -> int:
         f"text_offset 0x{header.text_offset:x}, image_size 0x{header.image_size:x}, "
         f"flags 0x{header.flags:x}"
     )
+    if header.bss:
+        print(
+            f"not stored: 0x{header.bss:x} bytes ({header.bss / header.image_size:.1%}) that the "
+            "header reserves - `.bss`, which the boot loader zero-fills"
+        )
     print(f"physical load: 0x{physical_load(kernel):08x}")
     return 0
 
@@ -186,7 +209,9 @@ def self_test() -> int:
     """Synthetic inputs, because the real ones only exist once a firmware has been pulled.
 
     What is being tested is the refusal behaviour as much as the happy path: a reader that accepts a
-    v3 header or a truncated Image silently produces a port of a kernel nobody is running.
+    v3 header, or a file that is not the kernel its own header describes, silently produces a port of
+    a kernel nobody is running. The `.bss` case is the opposite - a real dump is *always* shorter than
+    its header, so that one has to be accepted and accounted for rather than refused.
     """
     def boot_image(version: int, kernel: bytes, page: int = 0x1000) -> bytes:
         header = bytearray(page)
@@ -203,6 +228,7 @@ def self_test() -> int:
     boot = boot_image(BOOT_HEADER_VERSION, good_kernel)
     assert boot_kernel(boot) == good_kernel, "the kernel is not the span the header measures"
     assert image_header(good_kernel).text_offset == 0
+    assert image_header(good_kernel).bss == 0, "a complete Image reserves nothing"
     assert physical_load(good_kernel) == 0x80000000
     assert physical_load(image(b"\x00" * 0x100, text_offset=0x80000)) == 0x80080000
 
@@ -211,7 +237,9 @@ def self_test() -> int:
         ("a v3 boot header is refused", lambda: boot_kernel(boot_image(3, good_kernel))),
         ("a kernel that overruns the image is refused",
          lambda: boot_kernel(boot_image(4, good_kernel, page=0x100))),
-        ("a truncated Image is refused", lambda: image_header(good_kernel[:0x20])),
+        ("a buffer shorter than the Image header is refused", lambda: image_header(good_kernel[:0x10])),
+        ("a file longer than its header describes is refused",
+         lambda: image_header(good_kernel + b"\x00" * 0x100)),
         ("a non-lz4 file is refused", lambda: lz4_decompress(b"not lz4")),
     ]:
         try:
@@ -221,12 +249,25 @@ def self_test() -> int:
         else:
             results.append((label, False))
 
+    # And the case that used to be a refusal and is not one: `.bss` is not stored, so a boot-partition
+    # Image is always shorter than the header says, and refusing that would refuse every honest dump.
+    results.append(("a reserved-but-unstored `.bss` is accepted and measured", _bss_accepted()))
+
     for label, passed in results:
         print(f"self-test: {label} {'ok' if passed else 'FAILED'}")
     if all(passed for _, passed in results):
         print("self-test: the reader measures the header's kernel and refuses the rest")
         return 0
     return 1
+
+
+def _bss_accepted() -> bool:
+    """A file shorter than its header's `image_size`, which every boot-partition dump is."""
+    stored = 0x40 + 0x100
+    head = bytearray(0x40)
+    struct.pack_into("<QQQ", head, IMAGE_TEXT_OFFSET, 0, stored + 0x2000, 0xA)
+    header = image_header(bytes(head) + b"\x00" * 0x100)
+    return header.bss == 0x2000 and header.image_size == stored + 0x2000
 
 
 if __name__ == "__main__":

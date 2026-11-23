@@ -39,6 +39,10 @@ import struct
 import sys
 from pathlib import Path
 
+# The macro this tool measures. Named once, because the report, the JSON and `--emit-define` all have
+# to spell it the same way or `emit_target.py` would see two different findings.
+MACRO = "SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_OFF"
+
 # `sizeof(struct ctl_table)` on arm64 with this header: nine fields, five pointers either side of
 # `maxlen`/`mode`, which pad to one eight-byte word. Checked against the source, and then checked
 # again here against the array's own terminator, because a stride that is wrong walks off the array.

@@ -206,6 +206,43 @@ is the number a checker is most likely to "correct" into a wrong one:
 and page positions (`PIPE_BUF_FLAG_CAN_MERGE`, `MCAST_WAITER_OFF`, `SIGRETURN_*_WAITER_OFF`,
 `P0_ORACLE_*`). A comment in `target.h` says the same thing where a reader will meet it first.
 
+### `MCAST_WAITER_OFF` is not a struct field, so it was re-derived from the code
+
+`layout_check.py` can only compare struct members. `MCAST_WAITER_OFF` is the distance between two kernel
+*stack frames*, carried here as `0x78` from the sibling. A wrong value is silent at runtime - the writer
+still reports its window and simply writes nothing that lands - so it was re-derived against this Image
+using the recipe the `X916B` record documents, with every frame size read out of the disassembly:
+
+| Chain | Function | Frame | Local |
+| --- | --- | ---: | --- |
+| futex | `do_el0_svc` | `0x10` | |
+| | `el0_svc_common` | `0x30` | |
+| | `invoke_syscall` | `0x20` | |
+| | `__arm64_sys_futex` | `0x80` | |
+| | `do_futex` | `0x140` | |
+| | `futex_wait_requeue_pi` | `0x1b0` | `rt_mutex_waiter` at `sp+0x98` - the `add x1/x2/x3, sp, #0x98` operands of `remove_waiter`, `try_to_take_rt_mutex` and `rt_mutex_slowlock_block` |
+| setsockopt | `__arm64_sys_setsockopt` | `0x10` | |
+| | `__sys_setsockopt` | `0x70` | |
+| | `sock_common_setsockopt` | `0x10` | |
+| | `ipv6_setsockopt` | `0x40` | |
+| | `do_ipv6_setsockopt` | `0x60 + 0x260 = 0x2c0` | `group_source_req` at `sp+0x40` - `add x0, sp, #0x40` with `mov w2, #0x108` before `_copy_from_user` |
+
+`do_ipv6_setsockopt` is the one that misreads on a first pass: its prologue starts
+`stp x29, x30, [sp, #-0x60]!`, and the remaining `sub sp, sp, #0x260` appears a few instructions later
+in the same prologue, so the frame is `0x2c0`, not `0x60`.
+
+```text
+waiter           = E - (0x10+0x30+0x20+0x80+0x140+0x1b0) + 0x98 = E - 0x338
+greqs            = E - (0x10+0x30+0x20+0x10+0x70+0x10+0x40+0x2c0) + 0x40 = E - 0x3b0
+MCAST_WAITER_OFF = 0x3b0 - 0x338 = 0x78
+```
+
+So the carried `0x78` is correct for this firmware too, and the writer stage is not where run 5 failed
+because of a moved offset. The `0x108` is a second confirmation that the option really is
+`struct group_source_req` (`4 + 4 + 128 + 128`), and that `stamp + 0x08` is `gsr_group.ss_family` - which
+is why the forged `AF_UNSPEC` placed there is what turns into the `EADDRNOTAVAIL` the writer treats as
+its window flag.
+
 ## Tracefs event id and the two return addresses
 
 The slide's discovery reads `sched_blocked_reason` records, so it needs the event id and the return
@@ -483,3 +520,4 @@ because a feed entry is what makes the app stop using the path that works.
 | 2026-11-23 | Hardware run 4 (`KSNITCH_THRESHOLD_MULT=4`): collision stage passed on every attempt, then only DMA32-zone leaks at ~125 s/attempt until the 420 s cap. |
 | 2026-11-23 | Hardware run 5 (`KSNITCH_THRESHOLD_MULT=2`, 900 s): first full chain - normal-zone group at attempt 63, `sends=8192` SKB reclaim, `kernel page prepare` in 98 s, full PI sequence, `writer-return ... window=1`, `p0 physical write status=0 ok=1` - then `cfi misc_fops mismatch ret=0 read=0`. Disassembly of this kernel's `configfs_read_iter` and `ashmem_ioctl` shows the read-back forge is sound, so `ret=0` is the real `ashmem_read_iter` and the fake-fops pointer did not land. Boot spent by design. |
 | 2026-11-23 | `KERNELSNITCH_THRESHOLD_MULT` set to `2` in `target.h` (the measured signal is 2x-5x the baseline with an empty band between, so 2 and 5 admit the same 36 probes and 2 confirms them reliably); the environment override stays for one-boot sweeps. |
+| 2026-11-24 | Writer stage re-checked offline, since run 5's miss is the only open failure. `MCAST_WAITER_OFF 0x78` re-derived from this Image (futex waiter `E-0x338`, `greqs` `E-0x3b0`), so the biggest "wrong carried constant" candidate is ruled out. The read-back model was re-verified against `configfs_read_once`: `count` is the untouched `dev/ashm` prefix and `count - ki_pos = window >= len`, so a landed write always reads back 8 bytes and `ret=0` is a real miss; a `fake_fops | 1` write is also excluded, because the next `open()` would install it and the `read_iter` load one byte into the table would fault instead of continuing. Every shared `APP_*`/`FAKE_*`/`CFG_*`/`P0_*` macro value is identical to the proven sibling. No offline constant or layout error remains in this stage. |

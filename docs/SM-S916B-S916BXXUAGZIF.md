@@ -2,11 +2,12 @@
 
 ## Status
 
-**Scaffolded, syntax-verified, not measured.** The target directory exists and refuses to build:
-`measured.h` holds an `#error`, and `tools/port/emit_target.py` will replace it only from a report in
-which every value names the symbol, string or device reading it came from. What *has* been checked is
-the half that does not need a firmware: the carried-over header compiles in all four build shapes and
-lost no macro relative to the sibling port. Nothing here has run on hardware.
+**Scaffolded, syntax-verified, device-probed, not measured.** The target directory exists and refuses
+to build: `measured.h` holds an `#error`, and `tools/port/emit_target.py` will replace it only from a
+report in which every value names the symbol, string or device reading it came from. What has been
+checked is everything that does not need the Image: the carried-over header compiles in all four build
+shapes and lost no macro relative to the sibling port, and the phone has answered for its own kernel,
+its build fingerprint, the tracefs event id and its config. Nothing here has run on hardware.
 
 The sibling port `dm2q-S916BXXSAFZG1` (`docs/SM-S916B-S916BXXSAFZG1.md`) is the reference: same device,
 same kernel branch, previous release. It is where the layout constants in `target.h` come from, and its
@@ -21,8 +22,49 @@ same kernel branch, previous release. It is where the layout constants in `targe
 | Kernel version | `5.15.197` | leading three parts of the above |
 | KMI | `android13-5.15` | `android13-8` in the release string |
 | Firmware | `S916BXXUAGZIF` | kernel build id |
+| Build fingerprint | `samsung/dm2qxeea/dm2q:17/CP2A.260605.016/S916BXXUAGZIF:user/release-keys` | `getprop ro.build.fingerprint` |
 | Payload profile | `dm2q-S916BXXUAGZIF` | this directory |
 | Reference | `dm2q-S916BXXSAFZG1` (5.15.189) | `docs/SM-S916B-S916BXXSAFZG1.md` |
+
+## What the device itself answered
+
+Read over `adb` on 2026-11-23, from `uid=2000(shell)` `u:r:shell:s0` - the domain the chain runs in.
+None of this needed root, and it settles questions that were previously inference:
+
+| Reading | Value | Why it matters |
+| --- | --- | --- |
+| `uname -r` | `5.15.197-android13-8-34343818-abS916BXXUAGZIF` | the port's exact target |
+| `ro.build.fingerprint` | `samsung/dm2qxeea/dm2q:17/CP2A.260605.016/S916BXXUAGZIF:user/release-keys` | matches the public firmware listing for this PDA, so the phone is on the stock build |
+| `sched:sched_blocked_reason/id` | **`108`** | `SLIDE_TRACEFS_EVENT_ID`, measured rather than computed from the event table |
+| `/proc/mounts` (tracefs) | `tracefs rw,seclabel,relatime,gid=3012`, and `shell` is in gid 3012 | slide discovery is readable from `adb shell` |
+| `.../sched_blocked_reason/enable` | `-rw-rw-rw-` | and writable, so the chain can turn the event on without root |
+| `/proc/kallsyms` | `Permission denied` | the symbol half cannot be read from `shell`; it needs root or the Image |
+| `/sys/kernel/btf/vmlinux` | `Permission denied` | the layout check cannot be read from `shell` either |
+| `/proc/config.gz` (42167 B) | see below | the config decides which offsets apply at all |
+
+From that config: `CONFIG_KALLSYMS_ALL=y` (so `sysctl_bootid` and `random_table` are named symbols),
+`CONFIG_DEBUG_INFO_BTF=y` (the Image carries a BTF blob, so `tools/port/btf.py` has something to read),
+`CONFIG_ASHMEM=y` and `CONFIG_CONFIGFS_FS=y` (the two routes the chain uses exist), `CONFIG_MODVERSIONS=y`
+with `CONFIG_MODULE_SIG=y` but `# CONFIG_MODULE_SIG_FORCE is not set` (a module must match this build's
+vermagics and CRCs, and is signed but not rejected for it), `CONFIG_RANDOMIZE_BASE=y`, and no
+`CONFIG_RANDSTRUCT` at all (struct layouts follow the source order, which is why `ctl_table`'s `data`
+at `+8` worked for the sibling port - and `tools/port/random_table.py` searches for it anyway).
+
+`# CONFIG_SCHED_TRACER is not set` is not a problem despite the name: `sched_blocked_reason` comes from
+`CONFIG_TRACEPOINTS`, which is on, and the event answered with an id.
+
+## What the device would not answer
+
+Root, and that is what the port is missing:
+
+- no `su` on `PATH`, and the KernelSU manager is installed without its driver loaded - the late-load
+  that was running earlier in the day is gone after the last soft reboot;
+- `adb root` refuses (`adbd cannot run as root in production builds`, `ro.debuggable=0`, `ro.build.type=user`);
+- `/dev/block/by-name/boot` is `brw-------  root root`, so `shell` cannot read the partition.
+
+So the Image has to come from either a rooted `adb` session (`dd if=/dev/block/by-name/boot`) or the
+public firmware archive for `S916BXXUAGZIF` (`boot.img.lz4` inside `AP_*.tar.md5`). Everything after
+that is a command - see "The measurement, in order".
 
 ## What is carried over, and why that is not a guess
 
@@ -82,14 +124,17 @@ half) and the constants that stay a decision rather than a measurement.
 
 ## The numbers this port still owes
 
-Two are not a command. Both are recorded here with where they come from so the header cannot end up
+One is not a command. It is recorded here with where it comes from so the header cannot end up
 carrying a value nobody can trace:
 
 | Constant | Derived from | Passed in as |
 | --- | --- | --- |
-| `SLIDE_TRACEFS_EVENT_ID` | `cat /sys/kernel/tracing/events/sched/sched_blocked_reason/id` on the device, or `__TRACE_LAST_TYPE + index` from the Image's event table | `--trace-event-id` |
 | `SLIDE_TRACEFS_WORKER_CALLER_OFF` | the instruction after `bl schedule` in `worker_thread`, minus the image base | `--extra` |
 | `SLIDE_TRACEFS_VFORK_CALLER_OFF` | the same `bl schedule` on the `vfork` path; optional in the code, carried by the sibling port | `--extra` |
+
+`SLIDE_TRACEFS_EVENT_ID` is no longer on that list: it is **108**, read from the phone's own
+`/sys/kernel/tracing/events/sched/sched_blocked_reason/id` (see "What the device itself answered"). It
+happens to equal the sibling port's value, which is worth knowing but is not why it is in the header.
 
 Two more were on that list until they stopped being judgement calls:
 
@@ -143,3 +188,4 @@ first, because a feed entry is what makes the app stop using the path that works
 | --- | --- |
 | 2026-11-23 | Target scaffolded: `target.h` (carried layout), `measured.h` (an `#error`), `tools/port/` pipeline with self-tests. |
 | 2026-11-23 | Scaffold verified without a firmware: `tools/port/syntax_check.py` compiles the header four ways (app/standalone x with/without the optional measurements) against stub measurements, and diffs its macro names against `dm2q-S916BXXSAFZG1` - every macro the sibling header defines is defined or measured here. |
+| 2026-11-23 | Device read over `adb`: kernel and fingerprint confirmed, `SLIDE_TRACEFS_EVENT_ID` = 108 measured, tracefs writable by `u:r:shell:s0`, config flags recorded. No root on the device (`su` absent after a soft reboot, no `adb root`, block device root-only), so the Image still has to come from firmware or a rooted `dd`. |

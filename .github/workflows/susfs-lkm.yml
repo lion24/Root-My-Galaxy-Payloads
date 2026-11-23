@@ -86,6 +86,10 @@ on:
         description: "android.googlesource ref to build a KDIR from instead of the DDK image's own tree (e.g. refs/tags/android13-5.15.197_r00)"
         required: false
         default: ''
+      susfs_ref:
+        description: 'commit of the variant source to build instead of the branch it follows (the feed records it as source.ref)'
+        required: false
+        default: ''
   push:
     # Only what changes the build: prose about the build is not the build.
     paths:
@@ -174,6 +178,11 @@ jobs:
         run: |
           set -eu
           REF=$(python3 -c "import json,os;print(json.loads(os.environ['SUSFS_REFS'])[os.environ['VARIANT']])")
+          # The feed records the commit each artifact was built from. When a run names one, that is the
+          # source - a branch is only the right answer for a build meant to follow it.
+          if [ -n "${{ inputs.susfs_ref }}" ]; then
+            REF="${{ inputs.susfs_ref }}"
+          fi
           VERSION=$(python3 -c "import json,os;v=json.loads(os.environ['SUSFS_VERSIONS'])[os.environ['VARIANT']];print('' if v is None else v)")
           echo "VARIANT_REF=$REF" >> "$GITHUB_ENV"
           echo "VARIANT_VERSION=$VERSION" >> "$GITHUB_ENV"

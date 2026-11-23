@@ -182,9 +182,9 @@
         },
         {
           "kmi": "android13-5.15",
-          "url": "https://raw.githubusercontent.com/rushiranpise/Root-My-Galaxy-Payloads/main/susfs/samsung/susfs_guard_lkm-android13-5.15.ko",
-          "size": 714568,
-          "sha256": "4e63f70bd674855a7bb93d4da929185d271b98776e80a3647f530a870dabc535"
+          "url": "https://raw.githubusercontent.com/lion24/Root-My-Galaxy-Payloads/main/susfs/samsung/susfs_guard_lkm-android13-5.15.ko",
+          "size": 692768,
+          "sha256": "7addefa5b8ca2c6b5993e07b99a6c1fa0520dec8f23e1eba2146d4bdd6a6230d"
         },
         {
           "kmi": "android14-5.15",

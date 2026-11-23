@@ -184,7 +184,7 @@
           "kmi": "android13-5.15",
           "url": "https://raw.githubusercontent.com/lion24/Root-My-Galaxy-Payloads/main/susfs/samsung/susfs_guard_lkm-android13-5.15.ko",
           "size": 692768,
-          "sha256": "7addefa5b8ca2c6b5993e07b99a6c1fa0520dec8f23e1eba2146d4bdd6a6230d"
+          "sha256": "13e8458dbeabe3d51140fdc270dc85d7c4217fe153f178c81f0af3381529b44b"
         },
         {
           "kmi": "android14-5.15",

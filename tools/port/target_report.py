@@ -239,7 +239,9 @@ def main() -> int:
         "--trace-last-type",
         type=int,
         default=20,
-        help="`__TRACE_LAST_TYPE` for this kernel (kernel/trace/trace.h); 20 in Android 6.1",
+        help="`__TRACE_LAST_TYPE` for this kernel (kernel/trace/trace.h). 20 for ACK "
+             "android13-5.15.197_r00, whose enum has 19 members after `__TRACE_FIRST_TYPE`; the "
+             "porting document quotes the same number for 6.1, which is a coincidence, not a rule",
     )
     parser.add_argument("--json", help="write the findings here")
     parser.add_argument(

@@ -81,28 +81,47 @@ finding, not a number to paste.
 It exits non-zero when anything is unresolved, and lists what is missing. That is deliberate: the
 output of a partial run is not a header.
 
+## The one struct-internal pointer
+
+```sh
+tools/port/random_table.py --symbols vmlinux.nm --image kernel --emit-define
+```
+
+`SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_OFF` is the address of the `data` field of `random_table`'s
+`boot_id` entry. The tool walks the array from its symbol, finds the entry that holds the address of
+`sysctl_bootid` (or, when the build does not export that `static`, of the unique `boot_id` string), and
+reports the offset of the slot that holds it. The search is what makes it right on this kernel: the
+entry index and the field's offset are both properties of a build, and `struct ctl_table` is
+`__randomize_layout`, so neither `+4 * 0x40` nor `+8` is a rule. It tries both the symbol table's base
+and the link base for the Image's pointers, so a slid `/proc/kallsyms` and a link-time `llvm-nm` dump
+both work, and refuses if more than one base or more than one slot would explain the bytes.
+
 ## What is still a decision
 
-Two constants are not derivable from a symbol table, and the report says so by leaving them out:
+Three constants are not derivable from a symbol table, and the report says so by leaving them out:
 
 - **`SLIDE_TRACEFS_EVENT_ID`** - the event id is assigned at boot in linker order. With the event
-  table in the symbol table the tool computes it (`__TRACE_LAST_TYPE + index`); on a device that is
-  already rooted there is a better answer: `cat /sys/kernel/tracing/events/sched/sched_blocked_reason/id`,
-  passed back in with `--trace-event-id`.
-- **`SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_OFF`** - the address of the `data` pointer in `random_table`'s
-  `boot_id` entry. It is `random_table + index * sizeof(struct ctl_table) + 8`, where the index comes
-  from the tree's own `random_table` definition; no symbol carries it. Derive it from the source and
-  pass it with `--extra`, so the value in the report names where it came from instead of appearing
-  as a constant.
+  table in the symbol table the tool computes it (`__TRACE_LAST_TYPE + index`, and `--trace-last-type`
+  is where that first term comes from: in ACK `android13-5.15.197_r00` the enum has 19 members after
+  `__TRACE_FIRST_TYPE`, so it is 20); on a device that is already rooted there is a better answer:
+  `cat /sys/kernel/tracing/events/sched/sched_blocked_reason/id`, passed back in with
+  `--trace-event-id`.
+- **`SLIDE_TRACEFS_WORKER_CALLER_OFF`** - the instruction after `bl schedule` in `worker_thread` -
+  section 5 of the porting document. Disassemble that symbol in `vmlinux.elf`, take the following
+  instruction's address, subtract the image base, and pass it with `--extra` until that step is
+  automated too.
+- **`SLIDE_TRACEFS_VFORK_CALLER_OFF`** - the optional second return address the slide search also
+  tries: the same `bl schedule`, reached from the `vfork` path. It is optional in the code (`#ifdef`),
+  and the port should measure it anyway - with one caller the search only sees records the worker path
+  produced, and the sibling port carries both. Same derivation, also via `--extra`.
 
-`SLIDE_TRACEFS_WORKER_CALLER_OFF` is the instruction after `bl schedule` in `worker_thread` - section 5
-of the porting document. Disassemble that symbol in `vmlinux.elf`, take the following instruction's
-address, subtract the image base, and pass it with `--extra` until that step is automated too.
-
-`SLIDE_TRACEFS_VFORK_CALLER_OFF` is the optional second return address the slide search also tries: the
-same `bl schedule`, reached from the `vfork` path. It is optional in the code (`#ifdef`), and the port
-should measure it anyway - with one caller the search only sees records the worker path produced, and
-the sibling port carries both. Same derivation, also via `--extra`.
+`SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_OFF` used to be on that list as arithmetic
+(`random_table + index * sizeof(struct ctl_table) + 8`). It is now a measurement, in
+`tools/port/random_table.py`, because both of its terms move: in ACK `android13-5.15.197_r00` the
+entries are poolsize, entropy_avail, write_wakeup_threshold, urandom_min_reseed_secs, **boot_id**,
+uuid (index 4), which is not mainline's index; and `struct ctl_table` is `__randomize_layout`, so the
+`+8` is a property of the config rather than of the struct. The tool finds the entry by the pointer it
+holds, which is neither of those assumptions.
 
 ## The header, before it has numbers
 
@@ -123,11 +142,17 @@ forgot to carry.
 ## Writing the header
 
 ```sh
-tools/port/emit_target.py --report report.json --kimage-text-base 0xffffffc008000000 \
-  --physical-load 0x80000000 --build-fingerprint "$(adb shell getprop ro.build.fingerprint)" \
+tools/port/random_table.py --symbols vmlinux.nm --image kernel --json random_table.json
+tools/port/emit_target.py --report report.json --extra-json random_table.json \
+  --extra SLIDE_TRACEFS_WORKER_CALLER_OFF=<instruction after `bl schedule`> \
+  --kimage-text-base 0xffffffc008000000 \  --physical-load 0x80000000 --build-fingerprint "$(adb shell getprop ro.build.fingerprint)" \
   --fingerprint src/targets/dm2q-S916BXXUAGZIF/p0_fingerprint.h \
   --out src/targets/dm2q-S916BXXUAGZIF/measured.h
 ```
+
+The `--extra` values are the two tracefs callers, because no symbol table contains them: they are
+instructions found in a disassembly, and the header records them as "given on the command line" so a
+reader can see that they came from a person rather than from a measurement that can be repeated.
 
 It writes the file whole or not at all: every macro the target header needs must be in the report, the
 image base must be 2 MiB aligned (arm64 KASLR places the image on such a boundary, so a base that is
@@ -144,7 +169,7 @@ Each tool has one, because their real inputs only exist once a firmware has been
 that is wrong produces confident numbers rather than an error:
 
 ```sh
-for tool in kernel_image btf target_report emit_target syntax_check; do
+for tool in kernel_image btf target_report emit_target syntax_check random_table; do
   tools/port/$tool.py --self-test
 done
 ```

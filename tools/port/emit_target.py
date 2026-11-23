@@ -93,6 +93,28 @@ def load_report(path: Path) -> dict:
     return report
 
 
+def load_finding(path: Path) -> tuple[str, int, str]:
+    """One macro out of a tool that measured it on its own - `random_table.py --json`."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for field in ("macro", "value", "source"):
+        if field not in payload:
+            raise ValueError(f"{path} is not a single-finding file: no `{field}`")
+    if payload["value"] is None:
+        raise ValueError(f"{path} did not resolve {payload['macro']}")
+    return payload["macro"], int(payload["value"]), payload["source"]
+
+
+def merge(resolved: dict[str, tuple[int, str]], extras: list[tuple[str, int, str]]) -> None:
+    """Add the values measured outside the report, refusing to overwrite one that is already there."""
+    for macro, value, source in extras:
+        if macro in resolved:
+            raise ValueError(
+                f"{macro} arrives twice ({resolved[macro][1]!r} and {source!r}): the header would be "
+                "whatever the order of the arguments happened to be"
+            )
+        resolved[macro] = (value, source)
+
+
 def values(report: dict) -> dict[str, tuple[int, str]]:
     """The report as macro -> (value, source), refusing duplicates and unresolved entries."""
     resolved: dict[str, tuple[int, str]] = {}
@@ -145,7 +167,25 @@ def main() -> int:
     parser.add_argument("--physical-load", help="`P0_PHYS_OFFSET + text_offset`, as hex")
     parser.add_argument("--build-fingerprint", help="`getprop ro.build.fingerprint` of this build")
     parser.add_argument("--trace-event-id", type=int, help="the event id, if the report has none")
+    parser.add_argument(
+        "--extra",
+        action="append",
+        default=[],
+        metavar="MACRO=0xVALUE",
+        help="a value measured some other way (a disassembly, say); repeatable",
+    )
+    parser.add_argument(
+        "--extra-json",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="a single-finding JSON from another tool here, such as random_table.py --json; repeatable",
+    )
     parser.add_argument("--out", help="where to write measured.h")
+    parser.add_argument(
+        "--fingerprint",
+        help="the P0 table the header will include (default: p0_fingerprint.h beside --out)",
+    )
     parser.add_argument("--source", default="the device's own kernel", help="what was measured")
     parser.add_argument("--self-test", action="store_true", help="render a synthetic report")
     arguments = parser.parse_args()
@@ -157,8 +197,21 @@ def main() -> int:
 
     report = load_report(Path(arguments.report))
     resolved = values(report)
+    extras: list[tuple[str, int, str]] = []
+    for given in arguments.extra:
+        macro, _, raw = given.partition("=")
+        if not macro or not raw:
+            parser.error(f"--extra wants MACRO=0xVALUE, got {given!r}")
+        extras.append((macro, int(raw, 16), "given on the command line"))
+    for path in arguments.extra_json:
+        extras.append(load_finding(Path(path)))
     if arguments.trace_event_id is not None:
-        resolved["SLIDE_TRACEFS_EVENT_ID"] = (arguments.trace_event_id, "read on the device")
+        extras.append(("SLIDE_TRACEFS_EVENT_ID", arguments.trace_event_id, "read on the device"))
+    try:
+        merge(resolved, extras)
+    except ValueError as error:
+        print(f"cannot write a measured header: {error}", file=sys.stderr)
+        return 1
 
     missing = [macro for macro in REQUIRED if macro not in resolved]
     if missing:
@@ -187,7 +240,10 @@ def main() -> int:
     if arguments.build_fingerprint:
         extra["BUILD_FINGERPRINT"] = (arguments.build_fingerprint, "`ro.build.fingerprint`")
 
-    fingerprint = Path(arguments.out).parent / "p0_fingerprint.h"
+    fingerprint = (
+        Path(arguments.fingerprint) if arguments.fingerprint
+        else Path(arguments.out).parent / "p0_fingerprint.h"
+    )
     if not fingerprint.exists():
         print(
             f"cannot write a measured header: {fingerprint} does not exist; generate it with "
@@ -217,6 +273,8 @@ def self_test() -> int:
     report = {"text_base": 0xFFFFFFC008000000, "findings": findings}
     resolved = values(report)
     rendered = render(resolved, {"KIMAGE_TEXT_BASE": (0xFFFFFFC008000000, "test")})
+    with_extra = values(report)
+    merge(with_extra, [("SLIDE_TRACEFS_VFORK_CALLER_OFF", 0x1234, "given on the command line")])
 
     results = [
         ("every required macro renders", all(f"#define {macro}" in rendered for macro in REQUIRED)),
@@ -226,6 +284,9 @@ def self_test() -> int:
         ("a missing macro is refused", _refuses_missing()),
         ("an unaligned base is refused", _refuses_base()),
         ("a duplicate measurement is refused", _refuses_duplicate()),
+        ("a value measured elsewhere fills a macro the report lacks",
+         with_extra.get("SLIDE_TRACEFS_VFORK_CALLER_OFF", (None,))[0] == 0x1234),
+        ("a value measured elsewhere cannot overwrite a measured one", _refuses_merge()),
         ("KIMAGE_TEXT_BASE carries the link address",
          "#define KIMAGE_TEXT_BASE 0xffffffc008000000ULL" in rendered),
     ]
@@ -265,6 +326,15 @@ def _refuses_duplicate() -> bool:
     ]}
     try:
         values(report)
+    except ValueError:
+        return True
+    return False
+
+
+def _refuses_merge() -> bool:
+    resolved = {"INIT_TASK_OFF": (1, "symbol init_task")}
+    try:
+        merge(resolved, [("INIT_TASK_OFF", 2, "given on the command line")])
     except ValueError:
         return True
     return False

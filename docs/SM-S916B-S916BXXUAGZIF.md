@@ -65,7 +65,10 @@ tools/port/btf.py --image kernel --struct task_struct --struct rt_mutex_waiter \
   --struct page --struct file_operations --struct configfs_buffer \
   --struct pool_workqueue --struct worker_pool --struct pipe_buffer --json btf.json
 # 5. the header
-tools/port/emit_target.py --report report.json --kimage-text-base 0xffffffc008000000 \
+tools/port/random_table.py --symbols vmlinux.nm --image kernel --json random_table.json
+tools/port/emit_target.py --report report.json --extra-json random_table.json \
+  --extra SLIDE_TRACEFS_WORKER_CALLER_OFF=<instruction after `bl schedule`> \
+  --kimage-text-base 0xffffffc008000000 \
   --physical-load 0x80000000 --build-fingerprint "<ro.build.fingerprint>" \
   --fingerprint src/targets/dm2q-S916BXXUAGZIF/p0_fingerprint.h \
   --out src/targets/dm2q-S916BXXUAGZIF/measured.h
@@ -77,17 +80,28 @@ make TARGET=dm2q-S916BXXUAGZIF ANDROID_NDK_HOME=<ndk> release
 `tools/port/README.md` has the two input routes (boot partition, or `/proc/kallsyms` for the symbol
 half) and the constants that stay a decision rather than a measurement.
 
-## The four numbers this port still owes
+## The numbers this port still owes
 
-Everything else is a command. These four are not, and each one is recorded here with where it comes
-from so the header does not end up carrying a value nobody can trace:
+Two are not a command. Both are recorded here with where they come from so the header cannot end up
+carrying a value nobody can trace:
 
 | Constant | Derived from | Passed in as |
 | --- | --- | --- |
 | `SLIDE_TRACEFS_EVENT_ID` | `cat /sys/kernel/tracing/events/sched/sched_blocked_reason/id` on the device, or `__TRACE_LAST_TYPE + index` from the Image's event table | `--trace-event-id` |
 | `SLIDE_TRACEFS_WORKER_CALLER_OFF` | the instruction after `bl schedule` in `worker_thread`, minus the image base | `--extra` |
 | `SLIDE_TRACEFS_VFORK_CALLER_OFF` | the same `bl schedule` on the `vfork` path; optional in the code, carried by the sibling port | `--extra` |
-| `SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_OFF` | `random_table + index * sizeof(struct ctl_table) + 8`, with `index` read out of this tree's own `random_table` | `--extra` |
+
+Two more were on that list until they stopped being judgement calls:
+
+- `SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_OFF` is measured by `tools/port/random_table.py`, which finds the
+  `boot_id` entry by the pointer it holds rather than by the index and `+8` the porting document
+  derives. Both of those move: in ACK `android13-5.15.197_r00` the entries are poolsize,
+  entropy_avail, write_wakeup_threshold, urandom_min_reseed_secs, **boot_id**, uuid - index 4, not
+  mainline's - and `struct ctl_table` is `__randomize_layout`, so `+8` is a property of the config.
+- `__TRACE_LAST_TYPE`, the first term of the offline event id, is 20 for this KMI: ACK
+  `android13-5.15.197_r00`'s `enum trace_type` has 19 members after `__TRACE_FIRST_TYPE`, so the last
+  type is index 20. The porting document quotes 20 for a 6.1 kernel too, which is a coincidence worth
+  knowing rather than a constant to copy.
 
 ## Gates before this is published anywhere
 

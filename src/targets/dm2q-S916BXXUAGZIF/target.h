@@ -25,9 +25,12 @@
  * `docs/SM-S916B-S916BXXUAGZIF.md`.
  */
 
-/* `struct mm_struct`'s size, which decides which slab a `struct mm_struct` comes from. It is not a
- * `_OFF` macro because it is a size, but it moves with config (`CONFIG_MMU`, page-table levels), so
- * it is checked against this build's BTF in `tools/port/README.md` step 4 like one. */
+/* `struct mm_struct`, as the reclaim arithmetic needs it: not the struct's size, but the stride of the
+ * kmalloc cache that size is allocated from. This build's BTF says `sizeof(struct mm_struct)` is
+ * 0x3e0, which selects `kmalloc-1024`, and `slot = (mm - base) / MM_STRUCT_SZ` needs the cache's
+ * object stride, 0x400 - so `tools/port/layout_check.py` deliberately does not compare this constant
+ * against BTF: the two numbers are different measurements, and "correcting" this one to 0x3e0 would
+ * break every offset computed from it. */
 #ifndef MM_STRUCT_SZ
 #define MM_STRUCT_SZ 0x400
 #endif

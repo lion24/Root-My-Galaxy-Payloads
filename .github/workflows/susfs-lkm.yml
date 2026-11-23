@@ -90,6 +90,10 @@ on:
         description: 'commit of the variant source to build instead of the branch it follows (the feed records it as source.ref)'
         required: false
         default: ''
+      localversion:
+        description: "local version to append to the KDIR's release, so the module's vermagic slot holds the device's whole uname -r (e.g. -android13-8-34343818-abS916BXXUAGZIF)"
+        required: false
+        default: ''
   push:
     # Only what changes the build: prose about the build is not the build.
     paths:
@@ -327,6 +331,12 @@ jobs:
           mkdir -p /tmp/kdir-src /tmp/kdir
           curl -fsSL "https://android.googlesource.com/kernel/common/+archive/${{ inputs.kdir_tag }}.tar.gz" \
             | tar -xz -C /tmp/kdir-src
+          # The local version goes in here, not at the module link: `modules_prepare` is what writes
+          # `include/config/kernel.release`, and that file is the whole of the module's vermagic release.
+          # It has to be at least as long as the device's, because the loader patches the field in place
+          # and a slot too short for the kernel's own string cannot hold it.
+          LOCALVERSION="${{ inputs.localversion }}"
+          export LOCALVERSION
           make -C /tmp/kdir-src O=/tmp/kdir ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           make -C /tmp/kdir-src O=/tmp/kdir ARCH=arm64 LLVM=1 LLVM_IAS=1 modules_prepare -j"$(nproc)"
           echo "KDIR=/tmp/kdir" >> "$GITHUB_ENV"

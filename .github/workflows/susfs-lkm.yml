@@ -82,6 +82,10 @@ on:
         description: 'Raw-URL prefix the feed serves artifacts from'
         required: false
         default: 'https://raw.githubusercontent.com/rushiranpise/Root-My-Galaxy-Payloads/main'
+      kdir_tag:
+        description: "android.googlesource ref to build a KDIR from instead of the DDK image's own tree (e.g. refs/tags/android13-5.15.197_r00)"
+        required: false
+        default: ''
   push:
     # Only what changes the build: prose about the build is not the build.
     paths:
@@ -299,14 +303,39 @@ jobs:
             echo "::error::the Makefile does not build susfs_kp_stat.o"; exit 1; }
           echo "kp_stat overlay: in place, post-processing on kretprobes"
 
+      - name: A KDIR at the release this device runs, when one is named
+        if: inputs.kdir_tag != ''
+        run: |
+          # The image's KDIR is the branch head it was built from - 5.15.202 for this KMI - and a module
+          # compiled against it is a module for another kernel release. This builds the KDIR from the
+          # exact source ref instead, which is what makes the artifact's vermagic an honest statement
+          # rather than something the loader has to force in.
+          #
+          # `gki_defconfig` and `modules_prepare`, not a kernel build: this tier's module resolves its
+          # kernel symbols at load time, so what it needs from the tree is the config, the generated
+          # headers and the build scripts - not a vmlinux.
+          set -eu
+          mkdir -p /tmp/kdir-src /tmp/kdir
+          curl -fsSL "https://android.googlesource.com/kernel/common/+archive/${{ inputs.kdir_tag }}.tar.gz" \
+            | tar -xz -C /tmp/kdir-src
+          make -C /tmp/kdir-src O=/tmp/kdir ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          make -C /tmp/kdir-src O=/tmp/kdir ARCH=arm64 LLVM=1 LLVM_IAS=1 modules_prepare -j"$(nproc)"
+          echo "KDIR=/tmp/kdir" >> "$GITHUB_ENV"
+          echo "the KDIR is $(make -s -C /tmp/kdir kernelrelease)"
+          grep -E '^CONFIG_(CFI_CLANG|LTO_CLANG_FULL|MODVERSIONS|KALLSYMS_ALL|KPROBES)=' /tmp/kdir/.config
+
       - name: Build susfs_guard_lkm.ko
         run: |
           # `pipefail`, because the output is teed and the checks below read that file: a build that
           # failed would otherwise be read as a build that printed nothing.
           set -o pipefail
           : "${KDIR:?the DDK image is expected to set KDIR}"
+          # A KDIR built here has no `Module.symvers` (that costs a vmlinux), so modpost cannot check
+          # the imports and would fail the build on the first one. That is not a defect of the module:
+          # this tier's loader resolves those symbols against the running kernel's `/proc/kallsyms`
+          # before `init_module`, which is the whole point of shipping it with a loader.
           make -C "$KDIR" M="$PWD/susfs-src/kernel" \
-            ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 KBUILD_MODPOST_WARN=1 \
             -j"$(nproc)" modules 2>&1 | tee /tmp/lkm-build.log
           ls -l susfs-src/kernel/susfs_guard_lkm.ko
 

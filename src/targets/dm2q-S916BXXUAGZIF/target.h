@@ -42,7 +42,21 @@
 #define KSNITCH_COLLISIONS 4
 #define KERNELSNITCH_VERBOSE 0
 #define KERNELSNITCH_MTE_ENABLED 0
-#define KERNELSNITCH_THRESHOLD_MULT 10
+/* Firmware-decided, measured on `S916BXXUAGZIF` and not carryable from the S918/S928 profiles.
+ *
+ * The collision test is "is this probe slower than `mult`x the empty-bucket baseline", where the
+ * baseline is a full futex round trip and the signal is the cost of walking the piled-up bucket. That
+ * baseline is 26-28 ticks on this firmware (mean 27, min 26, tight enough that a 10-hour uptime and a
+ * fresh boot look identical), while the piled bucket only costs 135-370 ticks. At the carried `10` the
+ * cutoff sits at 270 - inside the signal - so only a handful of probes ever cross (`crossed=2..6` of
+ * the ~36 that meet the pile) and the 3-confirmation gate then rejects most, giving `only found 0..3
+ * collisions` on every run. The measured histogram is `over2 == over5 == 36` (the band between 2x and
+ * 5x is empty), which means `2` and `5` admit exactly the same probes; `2` is chosen because it also
+ * makes their repeat measurements reliable, so the gate stops discarding genuine collisions. This is
+ * the same physical signal the S918 profile sees, it is simply offset by a higher floor.
+ *
+ * `KSNITCH_THRESHOLD_MULT` in the environment still overrides this at runtime for a one-boot sweep. */
+#define KERNELSNITCH_THRESHOLD_MULT 2
 #define FAKE_WAITER_PRIO 130
 #define PSELECT_ENTER_DELAY_USEC 50000
 

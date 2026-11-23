@@ -359,6 +359,79 @@ make TARGET=dm2q-S916BXXUAGZIF ANDROID_NDK_HOME=<ndk> release
 `tools/port/README.md` has the two input routes (boot partition, or `/proc/kallsyms` for the symbol
 half) and the constants that stay a decision rather than a measurement.
 
+## Hardware runs
+
+Each run is one boot. The rule that shapes the sequence is that a failure *before* the stack writer is
+safe to retry, while a failure *after* it leaves PI state behind - so the run that first reached the
+writer is also the last one that boot allowed (`stack writer ran; refusing retry on this boot`).
+
+| # | Knob | What it got through | Where it stopped |
+| --- | --- | --- | --- |
+| 1 | carried profile | slide KASLR (`base=ffffffc008150000`, `slide=0x150000`) | collision search: `only found N collisions` |
+| 2 | `KSNITCH_TIMING_DIAG=1` | slide; four collision searches on one boot | same, with the numbers below |
+| 3 | `KSNITCH_TIMING_DIAG=1` + pile probe | slide, pile proven complete | collision search: `wanted=4`, `confirmed=1..3` |
+| 4 | `KSNITCH_THRESHOLD_MULT=4` | slide; collision search **passed** on every attempt | `dma32` skip only, ~125 s/attempt, out of time at the 420 s cap |
+| 5 | `KSNITCH_THRESHOLD_MULT=2`, 900 s | full chain: normal-zone group -> SKB reclaim -> kernel page -> stack writer | fake-fops read-back after the writer (`step=4`) |
+
+### The collision stage was a threshold bug, not a pile bug
+
+Run 2 measured the same four searches on one boot:
+
+| `approx_time` | threshold (10x) | min | max | mean | n |
+| --- | --- | --- | --- | --- | --- |
+| 27 | 270 | 26 | 357 | 27 | 81918 |
+| 28 | 280 | 26 | 362 | 27 | 81918 |
+| 27 | 270 | 26 | 359 | 27 | 81918 |
+| 27 | 270 | 26 | 296 | 27 | 81918 |
+
+The baseline is tight (26-28), so this was never environmental and a reboot would not have moved it.
+Run 3 then proved the pile itself lands: `ksnitch pile requested=256 created=256 woke=256
+wake_all=720123 per_entry=2812`. All 256 waiters enqueue, and one traversal of the piled bucket costs
+~2812 cycles. The scan probes 81918 keys against `hash_table_size = 256 * cpu_cnt = 4096`, so ~40 of
+them should land in the piled bucket (Poisson mean `81918/2048`, sigma ~6); exactly **36** do on every
+run, and their histogram is `over2=36 over5=36 over10=2..6`. The band between 2x and 5x is empty, which
+says the 36 are the pile and nothing else, and that the pile-time signal is only ~5-13x the baseline
+(135-370 ticks), **not** the 30x the carried `10` multiplier assumed. With threshold 270 only a handful
+of probes cross and the 3-confirmation gate discards most of those.
+
+The `pthread_create` accounting bug found while building the diagnostic is real and fixed
+(`pthread_create` returns `+errno` and never `-1`, so `SYSCHK` had been silently accepting a short
+pile), but it was not this failure: run 3 reports `created=256`.
+
+`mult=2` admits exactly the same 36 probes as `mult=5` (the histogram proves it) and makes their
+repeats reliable, so it is the value now compiled into `target.h`. The environment override stays for
+one-boot sweeps.
+
+### Run 5: the chain reached the stack writer
+
+```
+controlled mm group full group=2 base=ffffff8850270000 attempts=63 zone=normal
+controlled skb reclaim sends=8192 pairs=32 per_pair=256 ... mode=0
+kernel page prepare mode=0 attempt=1/2 elapsed_ms=98459 base=ffffff8850270000
+app fops slide route parent=ffffff8850271180 target=ffffffc00ad4d278 lock=ffffff8850271390
+slide pi stage=writer-enter tid=8715
+slide mcast returned domain=10 level=41 option=46 offset=0x78 ret=-1 errno=99 calls=1 sched_ok=1
+slide pi stage=writer-return tid=8715 sched_ok=1 window=1
+p0 physical write status=0 ok=1
+cfi misc_fops mismatch ret=0 target=ffffffc00ad4d278 read=0000000000000000 want=ffffff8850271180 errno=0
+```
+
+`target=ffffffc00ad4d278` is `ashmem_misc + 0x10` after the `0x150000` slide, i.e. exactly
+`&ashmem_misc.fops`; `want=ffffff8850271180` is `fake_fops`. The writer reports the scheduling window
+was hit (`window=1`) and its trigger returned success, but the read-back does not see `fake_fops`.
+
+That read-back was checked against this kernel's own code before it was believed. `configfs_read_iter`
+copies `buffer->count - ki_pos` bytes from `buffer->page + ki_pos`, and returns 0 when
+`count <= ki_pos`. The forged `configfs_buffer` overlays `ashmem_area`, whose name is prefixed with the
+11-byte `dev/ashmem/`, so `buffer->count` is the fixed first qword of that prefix - which is exactly
+`ASHMEM_PREFIX_COUNT`, and `configfs_read_once` picks `pos = ASHMEM_PREFIX_COUNT - window` so that
+`count - pos = window >= len` and `page + pos == target`. The disassembly of `ashmem_ioctl`
+(`strscpy(asma + 11, user, 256)`) confirms the blob lands at `asma + 11`, so `page` and
+`needs_read_fill` land at `configfs_buffer.page` and `.needs_read_fill`. In other words the forge is
+sound and a correct install would return 8 bytes. `ret=0` is what the *real* `ashmem_read_iter`
+returns when `[private_data + 0x128] == 0`, so on this boot the fake table was **not** installed -
+the PI write ran to a scheduling window but did not land in `&ashmem_misc.fops`.
+
 ## Gates before this is published anywhere
 
 Each of these is a refusal, not a warning - the sibling port's record is explicit about what happens
@@ -404,3 +477,9 @@ because a feed entry is what makes the app stop using the path that works.
 | 2026-11-23 | `boot.img` pulled while the late-load root was up (100663296 bytes, sha256 `ed1c34b5...`), unwrapped to the raw Image (46860800 bytes, sha256 `cc591b86...`), symbolled to 126441 offsets. Header read: `image_size 0x2f50000`, `text_offset 0`, `0x29f600` bytes of `.bss` not stored. |
 | 2026-11-23 | All 26 macros measured, event id `108`, both tracefs callers disassembled (`0x0010ddfc`, `0x000c90bc`). Three tool bugs found by the measurement - the `boot_id` string, the logger's name, the ashmem miscdevice - plus the `btf.py` walk desync at type 139399, `random_table.py`'s undefined `MACRO`, and `emit_target.py`'s include order. |
 | 2026-11-23 | `measured.h` generated (29 values, each naming its source) and `p0_fingerprint.h` written from the exact Image (32 rows, 256 source qwords verified). `layout_check.py` says all 53 carried constants agree with this build's BTF; `syntax_check.py` passes; `release` and `all` compile and link with NDK 28.2.13676358 (`release` padded to 104128 by hand - the recipe's `stat -c` is GNU). Not run on hardware. |
+| 2026-11-23 | Hardware run 1: slide passed (`base=ffffffc008150000`, `slide=0x150000`, both tracefs callers exact), collision search failed with `only found N collisions`. |
+| 2026-11-23 | Hardware run 2 (`KSNITCH_TIMING_DIAG=1`): four searches on one boot, `approx_time=27..28`, `max=296..362`, `n=81918`. Baseline is tight, so the failure is structural, not noise. Found that `reclaim=controlled` never calls `configure_kernelsnitch_profile`, so `SLIDE_KSNITCH_*` was never in play; the stage hardcodes `set_profile(256, REPEAT_MEASUREMENT, AVERAGE)` and `S918_KSNITCH_FULL_COLLISIONS`. Also fixed the `SYSCHK(pthread_create(...))` bug (it returns `+errno`, never `-1`). |
+| 2026-11-23 | Hardware run 3 (`KSNITCH_TIMING_DIAG=1`): pile probe proves the pile lands - `requested=256 created=256 woke=256 wake_all=720123 per_entry=2812` - and the histogram is `over2=36 over5=36 over10=2..6`. 36 matches the `81918/2048` prediction for the piled bucket, so the signal is real and the `10x` cutoff sits inside it. |
+| 2026-11-23 | Hardware run 4 (`KSNITCH_THRESHOLD_MULT=4`): collision stage passed on every attempt, then only DMA32-zone leaks at ~125 s/attempt until the 420 s cap. |
+| 2026-11-23 | Hardware run 5 (`KSNITCH_THRESHOLD_MULT=2`, 900 s): first full chain - normal-zone group at attempt 63, `sends=8192` SKB reclaim, `kernel page prepare` in 98 s, full PI sequence, `writer-return ... window=1`, `p0 physical write status=0 ok=1` - then `cfi misc_fops mismatch ret=0 read=0`. Disassembly of this kernel's `configfs_read_iter` and `ashmem_ioctl` shows the read-back forge is sound, so `ret=0` is the real `ashmem_read_iter` and the fake-fops pointer did not land. Boot spent by design. |
+| 2026-11-23 | `KERNELSNITCH_THRESHOLD_MULT` set to `2` in `target.h` (the measured signal is 2x-5x the baseline with an empty band between, so 2 and 5 admit the same 36 probes and 2 confirms them reliably); the environment override stays for one-boot sweeps. |

@@ -409,6 +409,7 @@ writer is also the last one that boot allowed (`stack writer ran; refusing retry
 | 3 | `KSNITCH_TIMING_DIAG=1` + pile probe | slide, pile proven complete | collision search: `wanted=4`, `confirmed=1..3` |
 | 4 | `KSNITCH_THRESHOLD_MULT=4` | slide; collision search **passed** on every attempt | `dma32` skip only, ~125 s/attempt, out of time at the 420 s cap |
 | 5 | `KSNITCH_THRESHOLD_MULT=2`, 900 s | full chain: normal-zone group -> SKB reclaim -> kernel page -> stack writer | fake-fops read-back after the writer (`step=4`) |
+| 6 | identical command, fresh boot (control) | full chain again: slide `0x1e0000`, group at attempt 89, page in 128 s, writer `window=1` | read-back again (`step=4`), same `calls=1` |
 
 ### The collision stage was a threshold bug, not a pile bug
 
@@ -469,6 +470,37 @@ sound and a correct install would return 8 bytes. `ret=0` is what the *real* `as
 returns when `[private_data + 0x128] == 0`, so on this boot the fake table was **not** installed -
 the PI write ran to a scheduling window but did not land in `&ashmem_misc.fops`.
 
+### Run 6: the miss is deterministic, so it is not the documented 50% race
+
+Run 6 repeated the exact same command on a fresh boot and reproduced run 5 line for line, with a different
+KASLR slide and a different reclaimed page:
+
+| | run 5 | run 6 |
+| --- | --- | --- |
+| slide | `0x150000`, base `ffffffc008150000` | `0x1e0000`, base `ffffffc0081e0000` |
+| reclaimed base | `ffffff8850270000` | `ffffff8895f38000` |
+| collision group | 2, attempt 63 | 5, attempt 89 |
+| kernel page | 98 s | 128 s |
+| writer | `cmp-return errno=35`, `wait_requeue_pi errno=110`, `mcast errno=99`, `calls=1 sched_ok=1`, `window=1` | identical |
+| read-back | `mismatch ret=0 read=0` | identical |
+
+That is two independent boots, two different address layouts, one outcome. The `X916B` record's "succeeds
+about half the time" does not apply to this profile: there is no coin to land, the write is never produced.
+
+It also means the writer's own success flags do not measure the write. `window=1` only means
+`setsockopt` returned `EADDRNOTAVAIL` while a `sched_setattr` on the waiter tid had succeeded; both are
+upstream of the forged erase and are true on a miss. `calls=1` is the useful number: the consumer's chain
+trigger ran exactly once, after `slide_consume_go` was set - and that store happens *after* `setsockopt`
+returns - so the forged copy had already been made and the syscall frame already unwound when the only
+`sched_setattr` fired.
+
+The open question is therefore not timing but reachability: whether the kernel still holds a reference to
+the waiter by the time the copy lands. `futex_wait_requeue_pi` returns `-ETIMEDOUT` *before* the writer
+runs, and its cleanup removes the waiter from the PI lock and clears `pi_blocked_on`, which is exactly the
+reference a later `sched_setattr` would walk. Verifying that against this kernel's `remove_waiter` gating
+is the next offline step, because a fix that only re-times the `sched_setattr` cannot help if the waiter
+is already unlinked.
+
 ## Gates before this is published anywhere
 
 Each of these is a refusal, not a warning - the sibling port's record is explicit about what happens
@@ -521,3 +553,4 @@ because a feed entry is what makes the app stop using the path that works.
 | 2026-11-23 | Hardware run 5 (`KSNITCH_THRESHOLD_MULT=2`, 900 s): first full chain - normal-zone group at attempt 63, `sends=8192` SKB reclaim, `kernel page prepare` in 98 s, full PI sequence, `writer-return ... window=1`, `p0 physical write status=0 ok=1` - then `cfi misc_fops mismatch ret=0 read=0`. Disassembly of this kernel's `configfs_read_iter` and `ashmem_ioctl` shows the read-back forge is sound, so `ret=0` is the real `ashmem_read_iter` and the fake-fops pointer did not land. Boot spent by design. |
 | 2026-11-23 | `KERNELSNITCH_THRESHOLD_MULT` set to `2` in `target.h` (the measured signal is 2x-5x the baseline with an empty band between, so 2 and 5 admit the same 36 probes and 2 confirms them reliably); the environment override stays for one-boot sweeps. |
 | 2026-11-24 | Writer stage re-checked offline, since run 5's miss is the only open failure. `MCAST_WAITER_OFF 0x78` re-derived from this Image (futex waiter `E-0x338`, `greqs` `E-0x3b0`), so the biggest "wrong carried constant" candidate is ruled out. The read-back model was re-verified against `configfs_read_once`: `count` is the untouched `dev/ashm` prefix and `count - ki_pos = window >= len`, so a landed write always reads back 8 bytes and `ret=0` is a real miss; a `fake_fops | 1` write is also excluded, because the next `open()` would install it and the `read_iter` load one byte into the table would fault instead of continuing. Every shared `APP_*`/`FAKE_*`/`CFG_*`/`P0_*` macro value is identical to the proven sibling. No offline constant or layout error remains in this stage. |
+| 2026-11-24 | Hardware run 6 (control, identical command on a fresh boot): reproduced run 5 line for line at slide `0x1e0000` / base `ffffff8895f38000`, group 5 attempt 89, page in 128 s, `calls=1 sched_ok=1 window=1`, `mismatch ret=0 read=0`. Two boots, two layouts, one outcome - so this is not the `X916B` "half the time" race and not a coin flip; the write is never produced. Also establishes that `window`/`sched_ok` are upstream of the forged erase and true on a miss, and that the only `sched_setattr` fires after `setsockopt` has returned. Boot spent; no retry by design. |

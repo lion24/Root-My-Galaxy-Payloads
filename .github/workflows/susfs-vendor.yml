@@ -35,15 +35,28 @@ name: SUSFS LKM (vendor release)
 # ## The three gates before a phone is offered this
 #
 # 1. **The release string is the device's, composed the way Samsung composes it.** Their
-#    `scripts/setlocalversion` prints `-${android_release}-${kmi_generation}${LOCALVERSION}-ab${BUILD_NUMBER}`
-#    and never the git sha, so the four inputs below are the whole of `vermagic`. Checked against
-#    `include/config/kernel.release`, not assumed.
+#    `scripts/setlocalversion` prints
+#    `-${android_release}-${kmi_generation}${CONFIG_LOCALVERSION}${LOCALVERSION}-ab${BUILD_NUMBER}`
+#    and never the git sha. The two leading parts are not environment variables the script reads:
+#    its Makefile hands them to it as arguments, from `$(GOOGLE_BRANCH)` and `$(KMI_GENERATION)`, so
+#    those are what a build has to export. `CONFIG_LOCALVERSION` is `""` in this phone's config. The
+#    result is checked against `include/config/kernel.release`, not assumed.
 # 2. **The undefined symbols exist on the device.** Every name the module imports is looked up in
 #    `vmlinux-S916BXXUAGZIF.nm.gz`, the recovered symbols of this phone's kernel. A name the kernel
 #    does not carry is a load that fails at `init_module`, which is cheap to learn here.
 # 3. **The offsets are the device's.** `susfs-lkm/vendor/abi` is a data-only module built against
 #    the same KDIR; its values are compared with the phone's BTF. A mismatch is refused here, because
 #    it is the failure a matching release string cannot catch.
+#
+# ## The one thing in the phone's config that a runner cannot honour
+#
+# `/proc/config.gz` is a faithful record of the phone's kernel, including
+# `CONFIG_UNUSED_KSYMS_WHITELIST="/home/dpi/qb5_8814/…/abi_symbollist.raw"` - an absolute path on
+# Samsung's build machine. With `CONFIG_TRIM_UNUSED_KSYMS=y`, `archprepare` generates
+# `include/generated/autoksyms.h` through `scripts/gen_autoksyms.sh`, which exits 1 when that
+# whitelist is missing, so `modules_prepare` stops before a single module is compiled. The whitelist
+# only names exported symbols a *vmlinux* would otherwise trim; this build has no vmlinux, so the
+# step empties it and leaves the rest of the config the phone's.
 #
 # A module this workflow produces has an **empty `__versions` section**: this builds a KDIR, not a
 # vmlinux, so there are no CRCs to carry. That is the same shape the exact-source KernelSU modules in
@@ -228,29 +241,65 @@ jobs:
           cp "$GITHUB_WORKSPACE/$DEFCONFIG" "$KDIR/.config"
           export PATH="$CLANG_BIN:$PATH"
           export ARCH=arm64 LLVM=1 LLVM_IAS=1
-          # Samsung's own four inputs to the release string. Set, `setlocalversion` prints them and
-          # nothing else; unset, it prints a `g<sha>` that is not this phone's release.
-          export android_release="$ANDROID_RELEASE" kmi_generation="$KMI_GENERATION"
+          # The release string is composed by this tree's own `scripts/setlocalversion` from the two
+          # arguments its Makefile passes - `$(GOOGLE_BRANCH)` and `$(KMI_GENERATION)` - plus
+          # `CONFIG_LOCALVERSION`, `LOCALVERSION` and `BUILD_NUMBER`. Those two come from the
+          # environment, so they are exported here. Both are required: their `sec_scm_version` prints
+          # `-${android_release}-${kmi_generation}${CONFIG_LOCALVERSION}${LOCALVERSION}-ab${BUILD_NUMBER}`
+          # only when both arrive as arguments, and `res` - a `-g<sha>` of a shallow clone whose files
+          # the extraction below has changed - when they do not.
+          export GOOGLE_BRANCH="$ANDROID_RELEASE"
+          export KMI_GENERATION
           export LOCALVERSION BUILD_NUMBER
           export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
 
           # The debug info is for a debugger on a build host, not for anything this module reads: it
           # would be most of the build's disk and time. Signing is off for the same reason - the
-          # phone's `CONFIG_MODULE_SIG_FORCE` is unset, and the loader is what decides. Tolerated
-          # rather than asserted, because `scripts/config` on a symbol this tree does not declare is
-          # a no-op-or-error depending on its version, and what matters is the config that comes
-          # out of `olddefconfig` - which is printed below either way.
+          # phone's `CONFIG_MODULE_SIG_FORCE` is unset and the loader is what decides, while `SIG_ALL`
+          # would make this tree mint a throwaway signing key for a module nothing on the phone
+          # verifies. `LOCALVERSION_AUTO` would let git put a `-g<sha>`/`-dirty` into the release:
+          # the string must be Samsung's, and this checkout's files are not the commit they claim.
+          #
+          # `CONFIG_UNUSED_KSYMS_WHITELIST` is this phone's own `/proc/config.gz` naming a file on
+          # Samsung's build machine - `/home/dpi/qb5_8814/…/abi_symbollist.raw`. With
+          # `TRIM_UNUSED_KSYMS=y`, `archprepare` generates `include/generated/autoksyms.h` through
+          # `scripts/gen_autoksyms.sh`, and that script exits 1 when the whitelist path it names is
+          # absent: the exact failure this run was dispatched to fix. The whitelist only names
+          # exported symbols a *vmlinux* would otherwise trim, and this build has no vmlinux, so the
+          # path is emptied. Trimming stays on: `include/linux/export.h` reads `autoksyms.h` under
+          # `CONFIG_TRIM_UNUSED_KSYMS && !defined(MODULE)`, so it cannot touch one byte of the
+          # external module below.
+          #
+          # Every edit here is tolerated rather than asserted, because `scripts/config` on a symbol
+          # this tree does not declare is a no-op-or-error depending on its version; what matters is
+          # the config `olddefconfig` leaves behind, and that is checked in the next block.
+          # `CONFIG_WERROR` is Samsung's CI strictness, not a property of the kernel this module has
+          # to match: with it on, a `-Wframe-larger-than=` or a format warning in a third-party
+          # module stops the build before there is anything to check. Off here, and reported below
+          # with the other settings that survived.
           "$COMMON/scripts/config" --file "$KDIR/.config" \
             --disable DEBUG_INFO --disable DEBUG_INFO_BTF --disable DEBUG_INFO_BTF_MODULES \
-            --disable MODULE_SIG --disable MODULE_SIG_ALL || true
+            --disable MODULE_SIG --disable MODULE_SIG_ALL \
+            --disable LOCALVERSION_AUTO --disable WERROR \
+            --set-str UNUSED_KSYMS_WHITELIST "" || true
           make -C "$COMMON" O="$KDIR" olddefconfig
-          for opt in DEBUG_INFO DEBUG_INFO_BTF MODULE_SIG MODULE_SIG_ALL; do
+          for opt in DEBUG_INFO DEBUG_INFO_BTF MODULE_SIG MODULE_SIG_ALL LOCALVERSION_AUTO WERROR; do
             if grep -q "^CONFIG_$opt=y" "$KDIR/.config"; then
               echo "::warning::$opt is still on after olddefconfig - the build will carry what it costs"
             else
               echo "$opt: off"
             fi
           done
+          # Not a warning: this is the one setting whose only possible value is a path on another
+          # machine, and `modules_prepare` stops dead on it before a single module is compiled.
+          whitelist=$(sed -n 's/^CONFIG_UNUSED_KSYMS_WHITELIST="//; s/"$//p' "$KDIR/.config")
+          trim=$(sed -n 's/^CONFIG_TRIM_UNUSED_KSYMS=//p' "$KDIR/.config")
+          echo "TRIM_UNUSED_KSYMS: ${trim:-off}, whitelist: '${whitelist}'"
+          if [ -n "$whitelist" ]; then
+            echo "::error::CONFIG_UNUSED_KSYMS_WHITELIST is still '$whitelist', a path that exists only on"
+            echo "::error::Samsung's build host - modules_prepare cannot generate autoksyms.h with it"
+            exit 1
+          fi
           # Which of the phone's own symbols this tree did not honour. It is a diagnostic, not a
           # gate: a dropped symbol that changes a struct the module reads shows up as an offset
           # mismatch below, with this list saying which option to blame.
@@ -268,6 +317,12 @@ jobs:
           echo "expected:     $RELEASE"
           if [ "$got" != "$RELEASE" ]; then
             echo "::error::the KDIR is not this phone's release, so every module built against it is for another kernel"
+            # The four inputs, so a `-g<sha>` reads as the missing argument it is rather than as a
+            # wrong tree: a release the tree composed from git is a release nobody can match.
+            echo "composed from GOOGLE_BRANCH='${GOOGLE_BRANCH:-<unset>}' KMI_GENERATION='${KMI_GENERATION:-<unset>}'"
+            echo "              LOCALVERSION='${LOCALVERSION:-<unset>}' BUILD_NUMBER='${BUILD_NUMBER:-<unset>}'"
+            grep -E '^CONFIG_(LOCALVERSION|LOCALVERSION_AUTO|BUILD_SALT)=' "$KDIR/.config" || true
+            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) =' "$COMMON/Makefile" || true
             exit 1
           fi
           echo "KDIR=$KDIR" >> "$GITHUB_ENV"
@@ -304,7 +359,12 @@ jobs:
           set -eu
           export PATH="$CLANG_BIN:$PATH"
           export ARCH=arm64 LLVM=1 LLVM_IAS=1
-          export android_release="$ANDROID_RELEASE" kmi_generation="$KMI_GENERATION"
+          # The same four inputs the KDIR was stamped with. `include/config/kernel.release` and
+          # `include/generated/utsrelease.h` are `FORCE` targets, so a step that regenerated either
+          # from the environment it lacked would hand this module a `-g<sha>` vermagic rather than
+          # the release its own KDIR answers - and vermagic is what the phone compares on load.
+          export GOOGLE_BRANCH="$ANDROID_RELEASE"
+          export KMI_GENERATION
           export LOCALVERSION BUILD_NUMBER
           export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
           # `KBUILD_MODPOST_WARN`, because a KDIR has no `Module.symvers`: modpost would otherwise
@@ -328,7 +388,12 @@ jobs:
           set -eu
           export PATH="$CLANG_BIN:$PATH"
           export ARCH=arm64 LLVM=1 LLVM_IAS=1
-          export android_release="$ANDROID_RELEASE" kmi_generation="$KMI_GENERATION"
+          # The same four inputs the KDIR was stamped with. `include/config/kernel.release` and
+          # `include/generated/utsrelease.h` are `FORCE` targets, so a step that regenerated either
+          # from the environment it lacked would hand this module a `-g<sha>` vermagic rather than
+          # the release its own KDIR answers - and vermagic is what the phone compares on load.
+          export GOOGLE_BRANCH="$ANDROID_RELEASE"
+          export KMI_GENERATION
           export LOCALVERSION BUILD_NUMBER
           export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
           make -C "$KDIR" M="$GITHUB_WORKSPACE/susfs-lkm/vendor/abi" KBUILD_MODPOST_WARN=1 modules \
@@ -373,7 +438,7 @@ jobs:
           export PATH="$CLANG_BIN:$PATH"
           cd "$SUSFS_SRC/kernel"
           modinfo ./susfs_guard_lkm.ko | tee "$GITHUB_WORKSPACE/modinfo.txt"
-          if ! grep -q "^vermagic: *$RELEASE " "$GITHUB_WORKSPACE/modinfo.txt"; then
+          if ! grep -Eq "^vermagic: +$RELEASE( |\$)" "$GITHUB_WORKSPACE/modinfo.txt"; then
             echo "::error::vermagic is not $RELEASE - the loader would refuse this module"
             exit 1
           fi

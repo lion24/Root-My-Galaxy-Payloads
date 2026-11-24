@@ -29,7 +29,7 @@ So: the tree and the config have to be Samsung's, not GKI's. That is this direct
 | tree | `WildKernels/Samsung_Kernels`, branch `SM-S918B-Oneui9`, `kernel_platform/common` | Samsung's OSRC drop per device and One UI release, with the toolchain it was built with. The S916B branch for One UI 9 does not exist yet, and the S23 Ultra is the same `sm8550`/`kalama` vendor tree; the config, which is what actually differs per device, is this phone's own. `common` rather than `msm-kernel`: this phone's vmlinux carries `init_defex_context`, `rkp_ro_alloc`, `kdp_*`, and `security/samsung` + `security/ddar` exist only in `common` - `msm-kernel/security/Makefile` lists neither. |
 | config | `S916BXXUAGZIF.config` | `/proc/config.gz` read off the phone. Not a defconfig: the built config, including Samsung's security options. |
 | compiler | the tree's `prebuilts/clang/host/linux-x86/clang-r450784e` | the compiler `CONFIG_CC_VERSION_TEXT` in the phone's config names. |
-| release | composed by the tree's `scripts/setlocalversion` | Samsung's own four inputs: `android_release=android13`, `kmi_generation=8`, `LOCALVERSION=-34343818`, `BUILD_NUMBER=S916BXXUAGZIF`. |
+| release | composed by the tree's `scripts/setlocalversion` | Samsung's own inputs: `GOOGLE_BRANCH=android13` and `KMI_GENERATION=8` (which its Makefile hands the script as arguments, so these are the names a build must export), `LOCALVERSION=-34343818`, `BUILD_NUMBER=S916BXXUAGZIF`, and `CONFIG_LOCALVERSION=""` from the phone's config. |
 | `__versions` | empty, by construction | a KDIR is not a vmlinux, so there are no CRCs to carry. Same shape as the exact-source KernelSU modules in `kernelsu/`; loading is the kallsyms-aware late load, not `insmod`. |
 
 ## The gates, in the order they run
@@ -52,6 +52,23 @@ So: the tree and the config have to be Samsung's, not GKI's. That is this direct
 5. **config** — `config-dropped.txt` lists the phone's config symbols this tree did not set. It is a
    diagnostic, not a gate: a dropped symbol that moves a struct shows up as an offset mismatch in
    gate 3, and this file says which option to blame.
+
+## The one setting the phone's config cannot be honoured on a runner
+
+`/proc/config.gz` is faithful, down to
+`CONFIG_UNUSED_KSYMS_WHITELIST="/home/dpi/qb5_8814/…/abi_symbollist.raw"` — an absolute path on the
+machine Samsung built the kernel on. With `CONFIG_TRIM_UNUSED_KSYMS=y`, `archprepare` generates
+`include/generated/autoksyms.h` via `scripts/gen_autoksyms.sh`, which exits 1 when that whitelist is
+absent, so `modules_prepare` stops before anything is compiled. That is a property of the config,
+not of the tree: the whitelist only names exported symbols a *vmlinux* would otherwise trim, and this
+build produces no vmlinux, so the step empties it and leaves every other option as the phone's.
+
+Two more settings are turned off for the same reason — they cost build time or fail the build, and
+cannot change a struct, a `vermagic` or a CFI hash: `DEBUG_INFO` (and its BTF derivations, which want
+`pahole`), `MODULE_SIG`/`MODULE_SIG_ALL` (the phone does not set `MODULE_SIG_FORCE`, and `SIG_ALL`
+would mint a throwaway key), plus `LOCALVERSION_AUTO` (so git cannot put a `-g<sha>` into the
+release) and `WERROR` (Samsung's CI strictness, not an ABI property). All five are reported back in
+the run's log and appear in `config-dropped.txt`.
 
 `btf-S916BXXUAGZIF.json` is the BTF decoded from the phone's `/sys/kernel/btf/vmlinux` (task_struct,
 mm_struct, page, file_operations and the rest of the structs the payload port measured). It is a

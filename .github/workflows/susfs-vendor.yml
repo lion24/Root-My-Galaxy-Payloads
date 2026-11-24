@@ -1,0 +1,416 @@
+name: SUSFS LKM (vendor release)
+
+# The `samsung` variant built against **Samsung's own tree at the device's release**, which is the
+# one thing the tier's per-KMI build cannot give it.
+#
+# ## Why this exists next to `susfs-lkm.yml`
+#
+# That workflow builds each variant against a DDK image's KDIR: the Android common kernel at the
+# branch head of its KMI, with `gki_defconfig`. The module's `vermagic` is then patched to the
+# device's release by the loader, and on a GKI device that is enough - the ABI is the same tree's.
+#
+# On these Samsung devices it is not. Measured on the S916B this workflow was written for
+# (`5.15.197-android13-8-34343818-abS916BXXUAGZIF`): the GKI-built `samsung` module loads, runs, and
+# takes the phone down with no diagnostic. The release string matches and the layout does not - the
+# device is built from Samsung's own tree, with `CONFIG_RKP`, `CONFIG_KDP`, `CONFIG_SECURITY_DEFEX`,
+# `CONFIG_SHADOW_CALL_STACK`, `CONFIG_ARM64_BTI_KERNEL`, `CONFIG_CFI_CLANG` + `LTO_CLANG_FULL`, and
+# struct layouts and CFI type hashes that a `gki_defconfig` tree does not have. A module that
+# carries `gki_defconfig` headers is a module compiled against the wrong structs; nothing in the
+# kernel can reject it, because the only check it makes is the version string.
+#
+# ## The source
+#
+# `WildKernels/Samsung_Kernels` is Samsung's OSRC drop per device and One UI release, one branch
+# each, published as the tarball Samsung ships (with the toolchain it was built with, and only the
+# changes that let the tree compile). Its branches are per device: `SM-S916B-*` for this phone.
+#
+# The phone in question runs One UI 9, and `SM-S916B-Oneui9` does not exist yet - so the branch this
+# workflow defaults to is **`SM-S918B-Oneui9`**: the S23 Ultra, the same `sm8550` (`kalama`) platform
+# and the same vendor tree, at the same One UI release. What differs between the two devices is the
+# board and the drivers; what the module links against - core structs, the exported symbol set, the
+# Samsung security tree - is one tree. The device's *own* configuration is compiled in regardless:
+# `susfs-lkm/vendor/S916BXXUAGZIF.config` is `/proc/config.gz` read off the phone, so the tree is
+# Samsung's and the config is the phone's.
+#
+# ## The three gates before a phone is offered this
+#
+# 1. **The release string is the device's, composed the way Samsung composes it.** Their
+#    `scripts/setlocalversion` prints `-${android_release}-${kmi_generation}${LOCALVERSION}-ab${BUILD_NUMBER}`
+#    and never the git sha, so the four inputs below are the whole of `vermagic`. Checked against
+#    `include/config/kernel.release`, not assumed.
+# 2. **The undefined symbols exist on the device.** Every name the module imports is looked up in
+#    `vmlinux-S916BXXUAGZIF.nm.gz`, the recovered symbols of this phone's kernel. A name the kernel
+#    does not carry is a load that fails at `init_module`, which is cheap to learn here.
+# 3. **The offsets are the device's.** `susfs-lkm/vendor/abi` is a data-only module built against
+#    the same KDIR; its values are compared with the phone's BTF. A mismatch is refused here, because
+#    it is the failure a matching release string cannot catch.
+#
+# A module this workflow produces has an **empty `__versions` section**: this builds a KDIR, not a
+# vmlinux, so there are no CRCs to carry. That is the same shape the exact-source KernelSU modules in
+# `kernelsu/` ship with, and it is why loading is a late load through the kallsyms-aware loader
+# rather than a plain `insmod`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Samsung OSRC mirror to clone (WildKernels/Samsung_Kernels)'
+        required: false
+        default: 'WildKernels/Samsung_Kernels'
+      source_branch:
+        description: 'Branch of that mirror: one device + One UI release each (SM-S918B-Oneui9 is the sm8550 tree at 5.15.197)'
+        required: false
+        default: 'SM-S918B-Oneui9'
+      defconfig:
+        description: 'Path in this repository of the device config to compile the KDIR with'
+        required: false
+        default: 'susfs-lkm/vendor/S916BXXUAGZIF.config'
+      release:
+        description: "The device's whole `uname -r`"
+        required: false
+        default: '5.15.197-android13-8-34343818-abS916BXXUAGZIF'
+      localversion:
+        description: 'The `-34343818` part: Samsung passes it in as LOCALVERSION'
+        required: false
+        default: '-34343818'
+      build_number:
+        description: 'The `S916BXXUAGZIF` part: Samsung passes it in as BUILD_NUMBER'
+        required: false
+        default: 'S916BXXUAGZIF'
+      android_release:
+        description: 'The `android13` part of the release'
+        required: false
+        default: 'android13'
+      kmi_generation:
+        description: 'The `8` part of the release'
+        required: false
+        default: '8'
+      susfs_repo:
+        description: 'Upstream susfs sources'
+        required: false
+        default: 'inforcqb/susfs4ksu-lkm'
+      susfs_ref:
+        description: 'Commit of upstream susfs to build (the commit the feed currently records)'
+        required: false
+        default: 'ba5c6d00977719f43cc827d362374a192c0e5c1a'
+      abi_probe:
+        description: 'Build the offsets probe and compare it with the device BTF'
+        required: false
+        type: boolean
+        default: true
+      device_btf:
+        description: 'Path of the device BTF dump to compare against'
+        required: false
+        default: 'susfs-lkm/vendor/btf-S916BXXUAGZIF.json'
+      device_syms:
+        description: 'Gzipped `llvm-nm` of the device vmlinux, for the import audit (`-` to skip)'
+        required: false
+        default: 'susfs-lkm/vendor/vmlinux-S916BXXUAGZIF.nm.gz'
+
+permissions:
+  contents: read
+
+jobs:
+  vendor:
+    name: susfs lkm (samsung, vendor tree)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    concurrency:
+      group: susfs-vendor
+      cancel-in-progress: false
+    env:
+      SOURCE_REPO: ${{ inputs.source_repo || 'WildKernels/Samsung_Kernels' }}
+      SOURCE_BRANCH: ${{ inputs.source_branch || 'SM-S918B-Oneui9' }}
+      SUSFS_REPO: ${{ inputs.susfs_repo || 'inforcqb/susfs4ksu-lkm' }}
+      SUSFS_REF: ${{ inputs.susfs_ref || 'ba5c6d00977719f43cc827d362374a192c0e5c1a' }}
+      RELEASE: ${{ inputs.release || '5.15.197-android13-8-34343818-abS916BXXUAGZIF' }}
+      DEFCONFIG: ${{ inputs.defconfig || 'susfs-lkm/vendor/S916BXXUAGZIF.config' }}
+      ANDROID_RELEASE: ${{ inputs.android_release || 'android13' }}
+      KMI_GENERATION: ${{ inputs.kmi_generation || '8' }}
+      LOCALVERSION: ${{ inputs.localversion || '-34343818' }}
+      BUILD_NUMBER: ${{ inputs.build_number || 'S916BXXUAGZIF' }}
+      DEVICE_BTF: ${{ inputs.device_btf || 'susfs-lkm/vendor/btf-S916BXXUAGZIF.json' }}
+      DEVICE_SYMS: ${{ inputs.device_syms || 'susfs-lkm/vendor/vmlinux-S916BXXUAGZIF.nm.gz' }}
+      # Upstream's sources land beside this repository's, not in `$RUNNER_TEMP`, so that the
+      # artifact paths below are all under the workspace and a failed run is inspectable.
+      SUSFS_SRC: ${{ github.workspace }}/susfs-src
+    steps:
+      - name: Checkout payloads
+        uses: actions/checkout@v7
+
+      - name: Room for a kernel tree
+        # A Samsung drop is a tarball the size of a kernel, and this compiles it: the runner's own
+        # images are what puts the build over the disk. Removing them first is the difference
+        # between a build and `No space left on device` an hour in.
+        run: |
+          set -eu
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift /usr/local/share/chromium || true
+          df -h / | tail -1
+
+      - name: Build dependencies
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bison flex libssl-dev libelf-dev bc gzip xz-utils kmod
+          for t in clang llvm-nm llvm-objcopy llvm-strip llvm-readelf strings python3 modinfo; do
+            if command -v "$t" >/dev/null 2>&1; then
+              echo "$t: $(command -v "$t")"
+            else
+              echo "$t: MISSING"
+            fi
+          done
+
+      - name: The vendor tree, at the release this phone runs
+        run: |
+          set -eu
+          TREE="$RUNNER_TEMP/tree"
+          mkdir -p "$TREE"
+          git clone --depth 1 -b "$SOURCE_BRANCH" --single-branch \
+            "https://github.com/$SOURCE_REPO.git" "$TREE"
+          git -C "$TREE" log -1 --format='%H %s'
+          echo "TREE=$TREE" >> "$GITHUB_ENV"
+
+      - name: The toolchain Samsung built it with, in place
+        # The drop ships its own prebuilt clang, compressed. Both the release string and the CFI type
+        # hashes come from this tree and this compiler, not from the runner's.
+        run: |
+          set -eu
+          cd "$TREE"
+          find . -type f -name '*.tar.xz' -print0 | while IFS= read -r -d '' f; do
+            echo "extracting $f"
+            tar -xf "$f"
+            rm -f "$f"
+          done
+          COMMON="$TREE/kernel_platform/common"
+          test -f "$COMMON/Makefile" || {
+            echo "::error::$COMMON is not a kernel tree"; ls -la "$TREE" | head -30; exit 1; }
+          grep -q '^VERSION = 5' "$COMMON/Makefile"
+          test -d "$COMMON/security/samsung" || {
+            echo "::error::this drop has no security/samsung: it is an ACK tree, not Samsung's, and a module"
+            echo "::error::built against it is the GKI one that crashed. Check the branch."
+            exit 1
+          }
+          # `kernel_platform/common`, not `kernel_platform/msm-kernel`: this phone's vmlinux carries
+          # Samsung's security code (`init_defex_context`, `rkp_ro_alloc`, `kdp_*` in its symbol table),
+          # and `security/samsung` + `security/ddar` exist only in this tree - `msm-kernel/security/Makefile`
+          # lists neither, so a KDIR built there would be a kernel this phone is not running.
+          test -d "$COMMON/security/ddar" || {
+            echo "::error::this drop has no security/ddar, so it is not the tree the phone's kernel came from"
+            exit 1
+          }
+          if [ -d "$TREE/kernel_platform/msm-kernel/security/samsung" ]; then
+            echo "::warning::msm-kernel carries security/samsung on this branch; the tree choice is worth re-checking"
+          else
+            echo "msm-kernel/security has no samsung/ - as expected, this is the right tree"
+          fi
+          grep -q 'sec_scm_version' "$COMMON/scripts/setlocalversion" || {
+            echo "::error::this tree's setlocalversion is not Samsung's - the release string below cannot be composed"
+            exit 1
+          }
+          CLANG_BIN="$COMMON/../prebuilts/clang/host/linux-x86/clang-r450784e/bin"
+          test -x "$CLANG_BIN/clang" || {
+            echo "::error::the drop does not carry Samsung's clang-r450784e prebuilt"; exit 1; }
+          echo "COMMON=$COMMON" >> "$GITHUB_ENV"
+          echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
+          "$CLANG_BIN/clang" --version | head -2
+
+      - name: The KDIR, compiled with this phone's own config
+        # `modules_prepare`, not a kernel build: what the module needs from the tree is the config,
+        # the generated headers and the build scripts. A vmlinux would buy `Module.symvers` (and so
+        # CRCs) at the cost of the LTO link, which is hours - and the loader this tier ships
+        # resolves symbols out of `/proc/kallsyms` instead, which is what makes a CRCs-free module
+        # its normal shape rather than a defect.
+        run: |
+          set -eu
+          KDIR="$RUNNER_TEMP/kdir"
+          mkdir -p "$KDIR"
+          cp "$GITHUB_WORKSPACE/$DEFCONFIG" "$KDIR/.config"
+          export PATH="$CLANG_BIN:$PATH"
+          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+          # Samsung's own four inputs to the release string. Set, `setlocalversion` prints them and
+          # nothing else; unset, it prints a `g<sha>` that is not this phone's release.
+          export android_release="$ANDROID_RELEASE" kmi_generation="$KMI_GENERATION"
+          export LOCALVERSION BUILD_NUMBER
+          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
+
+          # The debug info is for a debugger on a build host, not for anything this module reads: it
+          # would be most of the build's disk and time. Signing is off for the same reason - the
+          # phone's `CONFIG_MODULE_SIG_FORCE` is unset, and the loader is what decides. Tolerated
+          # rather than asserted, because `scripts/config` on a symbol this tree does not declare is
+          # a no-op-or-error depending on its version, and what matters is the config that comes
+          # out of `olddefconfig` - which is printed below either way.
+          "$COMMON/scripts/config" --file "$KDIR/.config" \
+            --disable DEBUG_INFO --disable DEBUG_INFO_BTF --disable DEBUG_INFO_BTF_MODULES \
+            --disable MODULE_SIG --disable MODULE_SIG_ALL || true
+          make -C "$COMMON" O="$KDIR" olddefconfig
+          for opt in DEBUG_INFO DEBUG_INFO_BTF MODULE_SIG MODULE_SIG_ALL; do
+            if grep -q "^CONFIG_$opt=y" "$KDIR/.config"; then
+              echo "::warning::$opt is still on after olddefconfig - the build will carry what it costs"
+            else
+              echo "$opt: off"
+            fi
+          done
+          # Which of the phone's own symbols this tree did not honour. It is a diagnostic, not a
+          # gate: a dropped symbol that changes a struct the module reads shows up as an offset
+          # mismatch below, with this list saying which option to blame.
+          cp "$GITHUB_WORKSPACE/$DEFCONFIG" /tmp/device.config
+          sed -n 's/^CONFIG_\([A-Z0-9_]*\)=.*/\1/p' /tmp/device.config | sort -u > /tmp/device-names.txt
+          sed -n 's/^CONFIG_\([A-Z0-9_]*\)=.*/\1/p' "$KDIR/.config" | sort -u > /tmp/kdir-names.txt
+          comm -23 /tmp/device-names.txt /tmp/kdir-names.txt > "$GITHUB_WORKSPACE/config-dropped.txt"
+          echo "device config symbols this tree does not set: $(wc -l < "$GITHUB_WORKSPACE/config-dropped.txt")"
+          head -40 "$GITHUB_WORKSPACE/config-dropped.txt"
+          cp "$KDIR/.config" "$GITHUB_WORKSPACE/config-effective.txt"
+          make -C "$COMMON" O="$KDIR" modules_prepare -j"$(nproc)"
+
+          got=$(cat "$KDIR/include/config/kernel.release")
+          echo "KDIR release: $got"
+          echo "expected:     $RELEASE"
+          if [ "$got" != "$RELEASE" ]; then
+            echo "::error::the KDIR is not this phone's release, so every module built against it is for another kernel"
+            exit 1
+          fi
+          echo "KDIR=$KDIR" >> "$GITHUB_ENV"
+          grep -E '^CONFIG_(CFI_CLANG|LTO_CLANG|LTO_CLANG_FULL|LTO_CLANG_THIN|MODVERSIONS|TRIM_UNUSED_KSYMS|SHADOW_CALL_STACK|ARM64_BTI_KERNEL|ARM64_PTR_AUTH_KERNEL|RKP|KDP|SECURITY_DEFEX|MODULE_SIG|DEBUG_INFO)=' "$KDIR/.config" || true
+          grep -E '^CONFIG_CC_VERSION_TEXT' "$KDIR/.config" || true
+
+      - name: Upstream's sources, at the commit the feed records
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SUSFS_REPO }}
+          ref: ${{ env.SUSFS_REF }}
+          path: susfs-src
+
+      - name: The pin, the version, and the overlay's surface
+        run: |
+          set -eu
+          git -C "$SUSFS_SRC" log -1 --format='%H %s'
+          test -f "$SUSFS_SRC/kernel/susfs.h"
+          # This variant records `2.3.0-gki`, and the feed entry will claim it. A pin that
+          # answered a different string would publish an entry its own artifact contradicts.
+          grep -q 'SUSFS_LKM_VERSION "2.3.0-gki"' "$SUSFS_SRC/kernel/susfs.h" || {
+            echo "::error::susfs.h does not carry the 2.3.0-gki string this variant's feed entry claims"
+            grep -n 'SUSFS_LKM_VERSION' "$SUSFS_SRC/kernel/susfs.h" || true
+            exit 1
+          }
+          grep -n 'SUSFS_LKM_VERSION' "$SUSFS_SRC/kernel/susfs.h"
+
+      - name: This repository's hook layer
+        run: bash "$GITHUB_WORKSPACE/susfs-lkm/vendor/overlay.sh" "$SUSFS_SRC"
+
+      - name: Build susfs_guard_lkm.ko against the vendor KDIR
+        run: |
+          set -o pipefail
+          set -eu
+          export PATH="$CLANG_BIN:$PATH"
+          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+          export android_release="$ANDROID_RELEASE" kmi_generation="$KMI_GENERATION"
+          export LOCALVERSION BUILD_NUMBER
+          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
+          # `KBUILD_MODPOST_WARN`, because a KDIR has no `Module.symvers`: modpost would otherwise
+          # fail the build on the first import. Those imports are resolved by the loader at
+          # `init_module`, and the audit below is what says every one of them exists on this phone.
+          make -C "$KDIR" M="$SUSFS_SRC/kernel" KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules \
+            2>&1 | tee "$GITHUB_WORKSPACE/lkm-build.log"
+          test -f "$SUSFS_SRC/kernel/susfs_guard_lkm.ko"
+          cd "$SUSFS_SRC/kernel"
+          before=$(stat -c %s susfs_guard_lkm.ko)
+          llvm-strip -d susfs_guard_lkm.ko
+          after=$(stat -c %s susfs_guard_lkm.ko)
+          echo "size: $before -> $after bytes"
+          cp susfs_guard_lkm.ko "$GITHUB_WORKSPACE/susfs_guard_lkm-vendor-$SOURCE_BRANCH.ko"
+          echo "BUILT=$GITHUB_WORKSPACE/susfs_guard_lkm-vendor-$SOURCE_BRANCH.ko" >> "$GITHUB_ENV"
+
+      - name: The offsets this KDIR compiles, as numbers
+        if: inputs.abi_probe
+        run: |
+          set -o pipefail
+          set -eu
+          export PATH="$CLANG_BIN:$PATH"
+          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+          export android_release="$ANDROID_RELEASE" kmi_generation="$KMI_GENERATION"
+          export LOCALVERSION BUILD_NUMBER
+          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
+          make -C "$KDIR" M="$GITHUB_WORKSPACE/susfs-lkm/vendor/abi" KBUILD_MODPOST_WARN=1 modules \
+            2>&1 | tee "$GITHUB_WORKSPACE/abi-build.log"
+          python3 "$GITHUB_WORKSPACE/susfs-lkm/vendor/abi/values.py" \
+            "$GITHUB_WORKSPACE/susfs-lkm/vendor/abi/abi_probe.ko" | tee "$GITHUB_WORKSPACE/abi.txt"
+
+      - name: The offsets are the device's, not a nearby tree's
+        if: inputs.abi_probe
+        run: |
+          set -eu
+          if [ ! -f "$GITHUB_WORKSPACE/$DEVICE_BTF" ]; then
+            echo "::error::no device BTF at $DEVICE_BTF - the offsets cannot be checked, and an unchecked offset is what took the phone down"
+            exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/susfs-lkm/vendor/abi/compare.py" \
+            "$GITHUB_WORKSPACE/$DEVICE_BTF" "$GITHUB_WORKSPACE/abi.txt"
+
+      - name: The imports are names this kernel actually has
+        run: |
+          set -eu
+          export PATH="$CLANG_BIN:$PATH"
+          cd "$SUSFS_SRC/kernel"
+          llvm-nm -u susfs_guard_lkm.ko | awk '{print $2}' | sort -u > "$GITHUB_WORKSPACE/imports.txt"
+          echo "imports: $(wc -l < "$GITHUB_WORKSPACE/imports.txt")"
+          if [ "$DEVICE_SYMS" = "-" ] || [ ! -f "$GITHUB_WORKSPACE/$DEVICE_SYMS" ]; then
+            echo "::warning::no device symbol table at $DEVICE_SYMS - the imports are listed but not audited"
+            exit 0
+          fi
+          gzip -dc "$GITHUB_WORKSPACE/$DEVICE_SYMS" | awk '{print $3}' | sed 's/\.\([0-9]*\)$//' | sort -u > /tmp/device-syms.txt
+          echo "device symbols: $(wc -l < /tmp/device-syms.txt)"
+          comm -23 "$GITHUB_WORKSPACE/imports.txt" /tmp/device-syms.txt | tee /tmp/missing.txt
+          if [ -s /tmp/missing.txt ]; then
+            echo "::error::the module imports names this kernel does not carry; the loader cannot resolve them"
+            exit 1
+          fi
+          echo "every import exists on this kernel"
+
+      - name: It is this module, it says this release, and it carries CFI
+        run: |
+          set -eu
+          export PATH="$CLANG_BIN:$PATH"
+          cd "$SUSFS_SRC/kernel"
+          modinfo ./susfs_guard_lkm.ko | tee "$GITHUB_WORKSPACE/modinfo.txt"
+          if ! grep -q "^vermagic: *$RELEASE " "$GITHUB_WORKSPACE/modinfo.txt"; then
+            echo "::error::vermagic is not $RELEASE - the loader would refuse this module"
+            exit 1
+          fi
+          if ! strings susfs_guard_lkm.ko | grep -q 'install path is kprobe-based'; then
+            echo "::error::this is not the samsung variant: our install path's marker is absent"
+            exit 1
+          fi
+          echo "=== sections ==="
+          llvm-readelf -S susfs_guard_lkm.ko | grep -E '__versions|\.rela\.text|cfi' || true
+          echo "=== CFI, and what the module will call into the kernel ==="
+          llvm-nm -u susfs_guard_lkm.ko | grep -E '__cfi|__kcfi' || echo "no CFI symbols"
+          echo "size: $(stat -c %s susfs_guard_lkm.ko)"
+          echo "sha256: $(sha256sum susfs_guard_lkm.ko | cut -d' ' -f1)"
+          {
+            echo "## susfs lkm (samsung, vendor tree)"
+            echo
+            echo "- source: \`$SOURCE_REPO@$SOURCE_BRANCH\`"
+            echo "- KDIR release: \`$(cat "$KDIR/include/config/kernel.release")\`"
+            echo "- module: $(stat -c %s susfs_guard_lkm.ko) bytes, \`$(sha256sum susfs_guard_lkm.ko | cut -d' ' -f1)\`"
+            echo "- imports: $(wc -l < "$GITHUB_WORKSPACE/imports.txt")"
+            echo
+            echo '```'
+            grep -E '^(vermagic|version|description|name|license|srcversion):' "$GITHUB_WORKSPACE/modinfo.txt" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: What was built, and what it was checked against
+        uses: actions/upload-artifact@v7
+        with:
+          name: susfs-lkm-vendor-${{ inputs.source_branch || 'SM-S918B-Oneui9' }}
+          path: |
+            susfs_guard_lkm-vendor-*.ko
+            imports.txt
+            modinfo.txt
+            lkm-build.log
+            abi.txt
+            abi-build.log
+            config-dropped.txt
+            config-effective.txt
+          if-no-files-found: error

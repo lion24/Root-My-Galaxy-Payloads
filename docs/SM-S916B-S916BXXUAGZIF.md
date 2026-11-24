@@ -501,6 +501,126 @@ reference a later `sched_setattr` would walk. Verifying that against this kernel
 is the next offline step, because a fix that only re-times the `sched_setattr` cannot help if the waiter
 is already unlinked.
 
+That step is done, and the answer is the one this run's evidence predicted: on every stock 5.15 path the
+waiter is unlinked before the copy lands, so the writer as shipped is unreachable here. The next section
+records the proof at the source, the Android-base and the binary level.
+
+## The writer's trigger is unreachable on this build
+
+Run 6 closed the timing explanation. What was left was a kernel-version explanation: the sibling ran the
+same app on `S916BXXSAFZG1` (`5.15.189`) and reached root, this build is `S916BXXUAGZIF` (`5.15.197`), and
+the one place a behaviour difference could hide is the PI-waiter cleanup. Specifically, if the sibling's
+tree were old enough that `rt_mutex_start_proxy_lock()` did **not** remove the waiter on `-EDEADLK`, the
+`cmp` syscall would leave `pi_blocked_on` pointing at the waiter, the app's later `setsockattr` would walk
+the forged copy, and the write would land - exactly what the app is built to rely on.
+
+That explanation is dead. It fails independently at the source level, the patch-series level and the
+binary level.
+
+### The split predates both firmwares
+
+The removing wrapper is not a later fix. The original upstream tag `v5.15` already ships
+`kernel/locking/rtmutex_api.c` with both functions:
+
+```text
+__rt_mutex_start_proxy_lock   enqueues unconditionally, does NOT remove on failure
+rt_mutex_start_proxy_lock     calls __rt_mutex_start_proxy_lock(), then
+                              if (unlikely(ret)) remove_waiter(lock, waiter)
+```
+
+The commit that split them, `531ae4b06a73 "locking/rtmutex: Split API from implementation"`, is dated
+`2021-08-17` and `git merge-base --is-ancestor` confirms it is an ancestor of
+`android13-5.15.189_r00`. A tree that has the split cannot lack the removal.
+
+### The exact Android bases are identical
+
+`S916BXXSAFZG1` and `S916BXXUAGZIF` both sit on ACK `android13-5.15`; the local partial clone of
+`kernel/common` carries the exact tags. Diffing them:
+
+```text
+git diff --stat android13-5.15.189_r00 android13-5.15.197_r00 -- kernel/locking/ kernel/futex/
+(no output)                                     # every file identical
+
+git diff --stat android13-5.15.189_r00 android13-5.15.197_r00 -- kernel/sched/
+kernel/sched/core.c               | 27 +++++
+kernel/sched/cpufreq_schedutil.c  | 28 +++++
+kernel/sched/deadline.c           |  4 +-
+kernel/sched/fair.c               | 39 +++---
+kernel/sched/rt.c                 |  6 +
+kernel/sched/vendor_hooks.c       |  5 +
+```
+
+The whole `kernel/sched/core.c` delta is `get_wchan()`, three Android `trace_android_vh_*` hooks and
+`EXPORT_SYMBOL_GPL(cpu_cgrp_subsys)`. Nothing touches `__sched_setscheduler()`, `sched_setattr()`,
+`rt_mutex_adjust_pi()` or any PI state. The gregkh tags agree: `kernel/locking/rtmutex.c`,
+`rtmutex_api.c` and `kernel/futex/core.c` are byte-identical between `v5.15.189` and `v5.15.197`.
+So the two firmwares' *Android* kernels behave identically on this path.
+
+### Every path clears the reference before userspace resumes
+
+There are only two proxy-lock call sites in `futex_requeue`'s reachable set, and both end with
+`pi_blocked_on == NULL`:
+
+- `futex_requeue()` (the `FUTEX_CMP_REQUEUE_PI` syscall) calls the removing wrapper
+  (`kernel/futex/core.c` -> `rt_mutex_start_proxy_lock`). Inside, `task_blocks_on_rt_mutex()` sets
+  `task->pi_blocked_on = waiter`, the chain walk returns `-EDEADLK`, and the wrapper calls
+  `remove_waiter()`, which does `rt_mutex_dequeue()` and `pi_blocked_on = NULL`. `remove_waiter()`
+  early-returns only when `waiter->task == NULL` - never on this path, because the waiter was enqueued.
+- `futex_lock_pi()` uses the non-removing `__rt_mutex_start_proxy_lock()`, but on any error (including a
+  timeout from `rt_mutex_wait_proxy_lock()`) it falls through to `rt_mutex_cleanup_proxy_lock()`, which
+  calls `remove_waiter()` unless the task became the owner - and becoming the owner goes through
+  `try_to_take_rt_mutex()`, which also clears `pi_blocked_on`.
+
+`rt_mutex_adjust_pi()` is the consumer's only entry (`__sched_setscheduler` -> `rt_mutex_adjust_pi`), and
+it is a no-op when `task->pi_blocked_on` is `NULL`.
+
+### The binary says the same thing
+
+The exact UAGZIF `vmlinux.elf` removes the waiter only for `ret < 0` and clears the field:
+
+```text
+rt_mutex_start_proxy_lock  0xffffffc0096f9464
+  ... bl task_blocks_on_rt_mutex
+  ... cbz w0, <skip>          ; ret == 0            -> no removal
+  ... ldar x8,[x19,#0x18]     ; lock->owner
+  ... cmp x8,#2 ; b.hs        ; a real owner keeps ret
+  ... mov w21,wzr             ; !owner              -> ret = 0 (skip)
+  ... tbz w21,#0x1f, <skip>   ; ret >= 0            -> no removal
+  ... bl remove_waiter        ; ret < 0             -> remove
+
+remove_waiter               0xffffffc0096f7474
+  ... bl rb_erase             ; 0xffffffc008ac6d7c  (the dequeue)
+  ... str xzr,[x20,#0x8b0]    ; task->pi_blocked_on = NULL
+
+rt_mutex_adjust_pi          0xffffffc0096f98b8
+  ... ldr x21,[x19,#0x8b0]    ; BTF: pi_blocked_on
+  ... cbz  ...                ; NULL -> return
+```
+
+So at the moment the consumer's `sched_setattr` runs, `pi_blocked_on` is `NULL`: no
+`rt_mutex_adjust_prio_chain`, no forged-waiter walk, no `rb_erase_cached`. `window=1` and `sched_ok=1`
+are both measured upstream of that erase and are true on a miss, which is exactly what runs 5 and 6
+showed. This is a reachability failure, not a race, and re-timing the `sched_setattr` cannot fix it.
+
+### What is left to explain, and why it is not offline-decidable here
+
+The sibling reached root with the same writer on the same phone, so *something* differs on
+`S916BXXSAFZG1`. Since both Android bases are byte-identical on this path, the difference can only live
+in Samsung's own patch stack (or a device config), and this machine has neither the `S916BXXSAFZG1`
+`vmlinux`/Image nor Samsung's released `SM-S916B_16_Opensource` tree, so that diff cannot be made here.
+The remaining possibilities are:
+
+1. A Samsung patch on `.189` that leaves the proxy waiter enqueued on the `-EDEADLK` path (or otherwise
+   keeps `pi_blocked_on` set across the return). This is the only kernel-side explanation that fits, and
+   it is testable only against the FZG1 binary or source.
+2. The sibling's reported success is real but depends on state this profile cannot recreate on `.197`
+   (for example a different reclaim/collect order that changes *when* the waiter tid is scheduled).
+
+Neither can be confirmed from this machine. What *can* be stated plainly: the MCAST stale-waiter writer
+as shipped is unreachable on `S916BXXUAGZIF`, and no constant, layout or timing change in the current
+app will make it reachable. A working port needs either the FZG1 kernel artefacts to identify the
+discriminator, or a different primitive that does not depend on a stale `pi_blocked_on`.
+
 ## Gates before this is published anywhere
 
 Each of these is a refusal, not a warning - the sibling port's record is explicit about what happens
@@ -554,3 +674,4 @@ because a feed entry is what makes the app stop using the path that works.
 | 2026-11-23 | `KERNELSNITCH_THRESHOLD_MULT` set to `2` in `target.h` (the measured signal is 2x-5x the baseline with an empty band between, so 2 and 5 admit the same 36 probes and 2 confirms them reliably); the environment override stays for one-boot sweeps. |
 | 2026-11-24 | Writer stage re-checked offline, since run 5's miss is the only open failure. `MCAST_WAITER_OFF 0x78` re-derived from this Image (futex waiter `E-0x338`, `greqs` `E-0x3b0`), so the biggest "wrong carried constant" candidate is ruled out. The read-back model was re-verified against `configfs_read_once`: `count` is the untouched `dev/ashm` prefix and `count - ki_pos = window >= len`, so a landed write always reads back 8 bytes and `ret=0` is a real miss; a `fake_fops | 1` write is also excluded, because the next `open()` would install it and the `read_iter` load one byte into the table would fault instead of continuing. Every shared `APP_*`/`FAKE_*`/`CFG_*`/`P0_*` macro value is identical to the proven sibling. No offline constant or layout error remains in this stage. |
 | 2026-11-24 | Hardware run 6 (control, identical command on a fresh boot): reproduced run 5 line for line at slide `0x1e0000` / base `ffffff8895f38000`, group 5 attempt 89, page in 128 s, `calls=1 sched_ok=1 window=1`, `mismatch ret=0 read=0`. Two boots, two layouts, one outcome - so this is not the `X916B` "half the time" race and not a coin flip; the write is never produced. Also establishes that `window`/`sched_ok` are upstream of the forged erase and true on a miss, and that the only `sched_setattr` fires after `setsockopt` has returned. Boot spent; no retry by design. |
+| 2026-11-24 | Offline: the writer's remaining kernel-version explanation is dead. Upstream `v5.15` already ships the `rtmutex_api.c` split (`531ae4b06a73`, 2021-08-17, ancestor of `android13-5.15.189_r00`), so the removing `rt_mutex_start_proxy_lock` cannot be missing from the sibling. ACK `android13-5.15.189_r00` vs `android13-5.15.197_r00` have zero diff under `kernel/locking/` and `kernel/futex/`; the only `kernel/sched/core.c` changes are `get_wchan()`, vendor trace hooks and an export. The UAGZIF binary confirms `rt_mutex_start_proxy_lock` calls `remove_waiter` only for `ret < 0`, and `remove_waiter` stores `NULL` to `[task+0x8b0]` (`pi_blocked_on`), while `rt_mutex_adjust_pi` returns on `NULL`. So `cmp`'s `EDEADLK` and the `wait_requeue_pi` timeout both leave `pi_blocked_on` cleared; `rt_mutex_adjust_prio_chain` never runs and the forged `rb_erase` never happens. The stale-waiter writer is unreachable on this build, re-timing cannot fix it, and the FZG1 discriminator is not offline-decidable (no FZG1 vmlinux/Image or Samsung source on this machine). |

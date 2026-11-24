@@ -292,8 +292,11 @@ jobs:
           done
           # Not a warning: this is the one setting whose only possible value is a path on another
           # machine, and `modules_prepare` stops dead on it before a single module is compiled.
-          whitelist=$(sed -n 's/^CONFIG_UNUSED_KSYMS_WHITELIST="//; s/"$//p' "$KDIR/.config")
-          trim=$(sed -n 's/^CONFIG_TRIM_UNUSED_KSYMS=//p' "$KDIR/.config")
+          # `awk -F'"'` reads that one line: a `sed` that strips the closing quote prints every line
+          # in the file that ends with one, which is how this check first reported the whole config
+          # as the whitelist's value.
+          whitelist=$(awk -F'"' '/^CONFIG_UNUSED_KSYMS_WHITELIST=/ { print $2 }' "$KDIR/.config")
+          trim=$(awk -F= '/^CONFIG_TRIM_UNUSED_KSYMS=/ { print $2 }' "$KDIR/.config")
           echo "TRIM_UNUSED_KSYMS: ${trim:-off}, whitelist: '${whitelist}'"
           if [ -n "$whitelist" ]; then
             echo "::error::CONFIG_UNUSED_KSYMS_WHITELIST is still '$whitelist', a path that exists only on"

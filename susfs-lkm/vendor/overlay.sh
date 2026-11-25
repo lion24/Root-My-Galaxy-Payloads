@@ -53,6 +53,45 @@ grep -qx 'bool susfs_expose_proc = false;' "$tp/susfs_main.c" || {
 }
 echo "control nodes: expose_proc defaults to false"
 
+# The one thing a load here cannot survive: a second `__this_module` relocation.
+#
+# `apply_relocations()` writes `cleanup_module` into `__this_module` at this KDIR's own
+# `struct module.exit` offset. This tree compiles `exit` at 0x368; the phone keeps
+# `target_list` at 0x368 (`module_unload_init` has just set its list head to point at
+# itself), so that write corrupts the list and `mod_sysfs_setup` walks it as a
+# `struct module_use` and dereferences two instructions of `.exit.text`. That is exactly
+# RWC 117/119: `mod_sysfs_setup+0x25c`, one boot per attempt, no module code ever run.
+# The checked-in `check-this-module.py` refuses a `.ko` whose only second slot is 0x368;
+# this edit makes the build one that cannot fail that gate: no `module_exit` -> no
+# `cleanup_module` symbol -> no relocation but `init` at 0x178 -> `target_list` stays the
+# empty list `module_unload_init` made -> the inlined `add_usage_links` hits
+# `list_empty()` and skips the dereference by construction. `exit` stays NULL, so
+# `delete_module` refuses to unload: the hiding module is not unloadable either way once
+# armed. `susfs_exit` has no other caller (the supercalls use `THIS_MODULE` only as a
+# pointer for `module_put`/`try_module_get`), so the function goes too - an unused
+# `__exit` function is a warning this build permits, but a dangling one is not honest.
+grep -q '^static void __exit susfs_exit(void)$' "$tp/susfs_main.c" || {
+	echo "::error::upstream moved or renamed susfs_exit in susfs_main.c; re-check this edit "
+	echo "::error::against the new shape before building - it decides RWC 117/119's bug"
+	exit 1
+}
+grep -q '^module_exit(susfs_exit);$' "$tp/susfs_main.c" || {
+	echo "::error::the module_exit(susfs_exit) line moved in susfs_main.c; re-check this edit"
+	exit 1
+}
+sed -i '/^module_exit(susfs_exit);$/d' "$tp/susfs_main.c"
+sed -i '/^static void __exit susfs_exit(void)$/,/^}$/d' "$tp/susfs_main.c"
+if grep -q 'susfs_exit' "$tp/susfs_main.c"; then
+	echo "::error::susfs_exit is still referenced in susfs_main.c after the removal edit"
+	exit 1
+fi
+grep -q '^module_init(susfs_init);$' "$tp/susfs_main.c" || {
+	echo "::error::module_init(susfs_init) is gone from susfs_main.c - the edit removed too much"
+	exit 1
+}
+echo "module exit: none - no second relocation, exit stays the device's business"
+
+
 # The stat family and the dirent rewrite, from kretprobes on the syscall entries.
 cp "$HERE/../susfs_kp_stat.c" "$tp/susfs_kp_stat.c"
 sed -i 's/^static __nocfi void susfs_kstat_post(/__nocfi void susfs_kstat_post(/' "$tp/susfs_kstat.c"

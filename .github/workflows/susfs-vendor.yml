@@ -46,7 +46,13 @@ name: SUSFS LKM (vendor release)
 #    does not carry is a load that fails at `init_module`, which is cheap to learn here.
 # 3. **The offsets are the device's.** `susfs-lkm/vendor/abi` is a data-only module built against
 #    the same KDIR; its values are compared with the phone's BTF. A mismatch is refused here, because
-#    it is the failure a matching release string cannot catch.
+#    it is the failure a matching release string cannot catch. `struct module` is in that probe
+#    since RWC 117/119: this tree's `exit` sat where the phone keeps `target_list` (0x368), and the
+#    gate's earlier schema measured everything but the one struct whose layout the load depends on.
+# 4. **The `__this_module` relocations are the device's slots.** Gate 3 proves the layout; the
+#    relocation proves where `apply_relocations()` will actually write. A second slot that is not
+#    0x178/0x378 is refused by `check-this-module.py` before the artifact is offered - and the
+#    overlay removes `module_exit` upstream, so a correct build carries no second relocation at all.
 #
 # ## The one thing in the phone's config that a runner cannot honour
 #
@@ -332,6 +338,42 @@ jobs:
           grep -E '^CONFIG_(CFI_CLANG|LTO_CLANG|LTO_CLANG_FULL|LTO_CLANG_THIN|MODVERSIONS|TRIM_UNUSED_KSYMS|SHADOW_CALL_STACK|ARM64_BTI_KERNEL|ARM64_PTR_AUTH_KERNEL|RKP|KDP|SECURITY_DEFEX|MODULE_SIG|DEBUG_INFO)=' "$KDIR/.config" || true
           grep -E '^CONFIG_CC_VERSION_TEXT' "$KDIR/.config" || true
 
+      - name: The offsets this KDIR compiles, as numbers
+        if: inputs.abi_probe
+        # Deliberately before upstream's sources and the module build: the compare in the next
+        # step needs only the KDIR, and a refusing compare must not have paid for the module
+        # build first. On the S918B-Oneui9 branch this is the step that names the `struct
+        # module` divergence (RWC 117/119) - the run is *supposed* to stop here until the
+        # missing option is honoured in the KDIR (see gate 4's comment beside the job "Build").
+        run: |
+          set -o pipefail
+          set -eu
+          export PATH="$CLANG_BIN:$PATH"
+          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+          # The same four inputs the KDIR was stamped with. `include/config/kernel.release` and
+          # `include/generated/utsrelease.h` are `FORCE` targets, so a step that regenerated either
+          # from the environment it lacked would hand this module a `-g<sha>` vermagic rather than
+          # the release its own KDIR answers - and vermagic is what the phone compares on load.
+          export GOOGLE_BRANCH="$ANDROID_RELEASE"
+          export KMI_GENERATION
+          export LOCALVERSION BUILD_NUMBER
+          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
+          make -C "$KDIR" M="$GITHUB_WORKSPACE/susfs-lkm/vendor/abi" KBUILD_MODPOST_WARN=1 modules \
+            2>&1 | tee "$GITHUB_WORKSPACE/abi-build.log"
+          python3 "$GITHUB_WORKSPACE/susfs-lkm/vendor/abi/values.py" \
+            "$GITHUB_WORKSPACE/susfs-lkm/vendor/abi/abi_probe.ko" | tee "$GITHUB_WORKSPACE/abi.txt"
+
+      - name: The offsets are the device's, not a nearby tree's
+        if: inputs.abi_probe
+        run: |
+          set -eu
+          if [ ! -f "$GITHUB_WORKSPACE/$DEVICE_BTF" ]; then
+            echo "::error::no device BTF at $DEVICE_BTF - the offsets cannot be checked, and an unchecked offset is what took the phone down"
+            exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/susfs-lkm/vendor/abi/compare.py" \
+            "$GITHUB_WORKSPACE/$DEVICE_BTF" "$GITHUB_WORKSPACE/abi.txt"
+
       - name: Upstream's sources, at the commit the feed records
         uses: actions/checkout@v7
         with:
@@ -384,36 +426,21 @@ jobs:
           cp susfs_guard_lkm.ko "$GITHUB_WORKSPACE/susfs_guard_lkm-vendor-$SOURCE_BRANCH.ko"
           echo "BUILT=$GITHUB_WORKSPACE/susfs_guard_lkm-vendor-$SOURCE_BRANCH.ko" >> "$GITHUB_ENV"
 
-      - name: The offsets this KDIR compiles, as numbers
-        if: inputs.abi_probe
-        run: |
-          set -o pipefail
-          set -eu
-          export PATH="$CLANG_BIN:$PATH"
-          export ARCH=arm64 LLVM=1 LLVM_IAS=1
-          # The same four inputs the KDIR was stamped with. `include/config/kernel.release` and
-          # `include/generated/utsrelease.h` are `FORCE` targets, so a step that regenerated either
-          # from the environment it lacked would hand this module a `-g<sha>` vermagic rather than
-          # the release its own KDIR answers - and vermagic is what the phone compares on load.
-          export GOOGLE_BRANCH="$ANDROID_RELEASE"
-          export KMI_GENERATION
-          export LOCALVERSION BUILD_NUMBER
-          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
-          make -C "$KDIR" M="$GITHUB_WORKSPACE/susfs-lkm/vendor/abi" KBUILD_MODPOST_WARN=1 modules \
-            2>&1 | tee "$GITHUB_WORKSPACE/abi-build.log"
-          python3 "$GITHUB_WORKSPACE/susfs-lkm/vendor/abi/values.py" \
-            "$GITHUB_WORKSPACE/susfs-lkm/vendor/abi/abi_probe.ko" | tee "$GITHUB_WORKSPACE/abi.txt"
-
-      - name: The offsets are the device's, not a nearby tree's
-        if: inputs.abi_probe
+      - name: The __this_module relocations are the device's slots
+        # `apply_relocations()` writes `init_module`/`cleanup_module` into `__this_module` at
+        # whatever offsets *this KDIR's* `struct module` has. If the tree's layout disagrees
+        # with the phone's, the write lands on a kernel field it must not touch - RWC 117/119
+        # died at `mod_sysfs_setup+0x25c` because a `cleanup_module` written to +0x368 was this
+        # phone's `target_list.next`. Nothing else (vermagic, symbol resolution, the offset
+        # gate beside this one) sees the difference in time, because the gate's probe measures
+        # `struct module` but only the *relocation* proves where the loader will write.
+        #
+        # Allowed: 0x178 (init, required), 0x378 (exit - also only when the module keeps
+        # module_exit). Anything else, 0x368 in particular, is the corruption that merged the
+        # relocation bug with the `module_unload_init` list heads.
         run: |
           set -eu
-          if [ ! -f "$GITHUB_WORKSPACE/$DEVICE_BTF" ]; then
-            echo "::error::no device BTF at $DEVICE_BTF - the offsets cannot be checked, and an unchecked offset is what took the phone down"
-            exit 1
-          fi
-          python3 "$GITHUB_WORKSPACE/susfs-lkm/vendor/abi/compare.py" \
-            "$GITHUB_WORKSPACE/$DEVICE_BTF" "$GITHUB_WORKSPACE/abi.txt"
+          python3 "$GITHUB_WORKSPACE/susfs-lkm/vendor/check-this-module.py" "$BUILT"
 
       - name: The imports are names this kernel actually has
         run: |
@@ -467,6 +494,23 @@ jobs:
             grep -E '^(vermagic|version|description|name|license|srcversion):' "$GITHUB_WORKSPACE/modinfo.txt" || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: The diagnostics, even when a gate refuses the build
+        # The offset compare is the step most likely to fail a run, and the artifact that
+        # explains it (which of the phone's config options this tree dropped) is written by
+        # the KDIR step before the compare runs. On failure-only this still uploads it: the
+        # diff above plus this list is what turns a refused build into the name of the
+        # option to honour, without rebuilding anything.
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: susfs-lkm-vendor-diagnostics-${{ inputs.source_branch || 'SM-S918B-Oneui9' }}
+          path: |
+            abi.txt
+            abi-build.log
+            config-dropped.txt
+            config-effective.txt
+          if-no-files-found: ignore
 
       - name: What was built, and what it was checked against
         uses: actions/upload-artifact@v7

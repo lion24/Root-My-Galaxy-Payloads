@@ -3549,5 +3549,509 @@
       }
     ],
     "unusable": []
+  },
+  {
+    "struct": "module",
+    "size": 960,
+    "members": [
+      {
+        "name": "state",
+        "bit_offset": 0,
+        "byte_offset": 0,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "list",
+        "bit_offset": 64,
+        "byte_offset": 8,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "name",
+        "bit_offset": 192,
+        "byte_offset": 24,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "mkobj",
+        "bit_offset": 640,
+        "byte_offset": 80,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "modinfo_attrs",
+        "bit_offset": 1664,
+        "byte_offset": 208,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "version",
+        "bit_offset": 1728,
+        "byte_offset": 216,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "srcversion",
+        "bit_offset": 1792,
+        "byte_offset": 224,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "scmversion",
+        "bit_offset": 1856,
+        "byte_offset": 232,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "holders_dir",
+        "bit_offset": 1920,
+        "byte_offset": 240,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "syms",
+        "bit_offset": 1984,
+        "byte_offset": 248,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "crcs",
+        "bit_offset": 2048,
+        "byte_offset": 256,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_syms",
+        "bit_offset": 2112,
+        "byte_offset": 264,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "cfi_check",
+        "bit_offset": 2176,
+        "byte_offset": 272,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "param_lock",
+        "bit_offset": 2240,
+        "byte_offset": 280,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "kp",
+        "bit_offset": 2624,
+        "byte_offset": 328,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_kp",
+        "bit_offset": 2688,
+        "byte_offset": 336,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_gpl_syms",
+        "bit_offset": 2720,
+        "byte_offset": 340,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "gpl_syms",
+        "bit_offset": 2752,
+        "byte_offset": 344,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "gpl_crcs",
+        "bit_offset": 2816,
+        "byte_offset": 352,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "using_gplonly_symbols",
+        "bit_offset": 2880,
+        "byte_offset": 360,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "sig_ok",
+        "bit_offset": 2888,
+        "byte_offset": 361,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "async_probe_requested",
+        "bit_offset": 2896,
+        "byte_offset": 362,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_exentries",
+        "bit_offset": 2912,
+        "byte_offset": 364,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "extable",
+        "bit_offset": 2944,
+        "byte_offset": 368,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "init",
+        "bit_offset": 3008,
+        "byte_offset": 376,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "core_layout",
+        "bit_offset": 3072,
+        "byte_offset": 384,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "init_layout",
+        "bit_offset": 3712,
+        "byte_offset": 464,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "arch",
+        "bit_offset": 4352,
+        "byte_offset": 544,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "taints",
+        "bit_offset": 4608,
+        "byte_offset": 576,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_bugs",
+        "bit_offset": 4672,
+        "byte_offset": 584,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "bug_list",
+        "bit_offset": 4736,
+        "byte_offset": 592,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "bug_table",
+        "bit_offset": 4864,
+        "byte_offset": 608,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "kallsyms",
+        "bit_offset": 4928,
+        "byte_offset": 616,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "core_kallsyms",
+        "bit_offset": 4992,
+        "byte_offset": 624,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "sect_attrs",
+        "bit_offset": 5248,
+        "byte_offset": 656,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "notes_attrs",
+        "bit_offset": 5312,
+        "byte_offset": 664,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "args",
+        "bit_offset": 5376,
+        "byte_offset": 672,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "percpu",
+        "bit_offset": 5440,
+        "byte_offset": 680,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "percpu_size",
+        "bit_offset": 5504,
+        "byte_offset": 688,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "noinstr_text_start",
+        "bit_offset": 5568,
+        "byte_offset": 696,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "noinstr_text_size",
+        "bit_offset": 5632,
+        "byte_offset": 704,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_tracepoints",
+        "bit_offset": 5664,
+        "byte_offset": 708,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "tracepoints_ptrs",
+        "bit_offset": 5696,
+        "byte_offset": 712,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_srcu_structs",
+        "bit_offset": 5760,
+        "byte_offset": 720,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "srcu_struct_ptrs",
+        "bit_offset": 5824,
+        "byte_offset": 728,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_bpf_raw_events",
+        "bit_offset": 5888,
+        "byte_offset": 736,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "bpf_raw_events",
+        "bit_offset": 5952,
+        "byte_offset": 744,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "btf_data_size",
+        "bit_offset": 6016,
+        "byte_offset": 752,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "btf_data",
+        "bit_offset": 6080,
+        "byte_offset": 760,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "jump_entries",
+        "bit_offset": 6144,
+        "byte_offset": 768,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_jump_entries",
+        "bit_offset": 6208,
+        "byte_offset": 776,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_trace_bprintk_fmt",
+        "bit_offset": 6240,
+        "byte_offset": 780,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "trace_bprintk_fmt_start",
+        "bit_offset": 6272,
+        "byte_offset": 784,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "trace_events",
+        "bit_offset": 6336,
+        "byte_offset": 792,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_trace_events",
+        "bit_offset": 6400,
+        "byte_offset": 800,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "trace_evals",
+        "bit_offset": 6464,
+        "byte_offset": 808,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_trace_evals",
+        "bit_offset": 6528,
+        "byte_offset": 816,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "kprobes_text_start",
+        "bit_offset": 6592,
+        "byte_offset": 824,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "kprobes_text_size",
+        "bit_offset": 6656,
+        "byte_offset": 832,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "kprobe_blacklist",
+        "bit_offset": 6720,
+        "byte_offset": 840,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_kprobe_blacklist",
+        "bit_offset": 6784,
+        "byte_offset": 848,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "source_list",
+        "bit_offset": 6848,
+        "byte_offset": 856,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "target_list",
+        "bit_offset": 6976,
+        "byte_offset": 872,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "exit",
+        "bit_offset": 7104,
+        "byte_offset": 888,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "refcnt",
+        "bit_offset": 7168,
+        "byte_offset": 896,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "ei_funcs",
+        "bit_offset": 7232,
+        "byte_offset": 904,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "num_ei_funcs",
+        "bit_offset": 7296,
+        "byte_offset": 912,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "android_kabi_reserved1",
+        "bit_offset": 7360,
+        "byte_offset": 920,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "android_kabi_reserved2",
+        "bit_offset": 7424,
+        "byte_offset": 928,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "android_kabi_reserved3",
+        "bit_offset": 7488,
+        "byte_offset": 936,
+        "bitfield_bits": 0,
+        "path": []
+      },
+      {
+        "name": "android_kabi_reserved4",
+        "bit_offset": 7552,
+        "byte_offset": 944,
+        "bitfield_bits": 0,
+        "path": []
+      }
+    ],
+    "unusable": []
   }
 ]

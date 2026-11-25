@@ -117,6 +117,32 @@ const unsigned long susfs_abi_values[] __used = {
 	V(sizeof(struct work_struct)),
 	V(sizeof(struct user_namespace)),
 	V(offsetof(struct user_namespace, uid_map)),
+
+	/* --- struct module: the one struct whose layout decides whether a load survives --- */
+	/* RWC 117/119: apply_relocations() wrote cleanup_module into mod + 0x368 because this
+	 * array's own KDIR compiled `exit` there, and the phone keeps `target_list` at 0x368.
+	 * mod_sysfs_setup() walked the freshly corrupted list head and dereferenced two
+	 * instructions of .exit.text. Only `init` (0x178) was checked by anything downstream;
+	 * these are the offsets that decide this module's load, measured from the device's own
+	 * BTF (expect 0x3c0, 0x18, 0x50, 0xd0, 0xf0, 0x110, 0x148, 0x150, 0x178, 0x180, 0x1d0,
+	 * 0x220, 0x240, 0x358, 0x368, 0x378, 0x380). */
+	V(sizeof(struct module)),
+	V(offsetof(struct module, name)),
+	V(offsetof(struct module, mkobj)),
+	V(offsetof(struct module, modinfo_attrs)),
+	V(offsetof(struct module, holders_dir)),
+	V(offsetof(struct module, cfi_check)),
+	V(offsetof(struct module, kp)),
+	V(offsetof(struct module, num_kp)),
+	V(offsetof(struct module, init)),
+	V(offsetof(struct module, core_layout)),
+	V(offsetof(struct module, init_layout)),
+	V(offsetof(struct module, arch)),
+	V(offsetof(struct module, taints)),
+	V(offsetof(struct module, source_list)),
+	V(offsetof(struct module, target_list)),
+	V(offsetof(struct module, exit)),
+	V(offsetof(struct module, refcnt)),
 };
 
 static int __init abi_probe_init(void)

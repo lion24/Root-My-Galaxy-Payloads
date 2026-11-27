@@ -155,3 +155,45 @@ for pat in 'r->mnt\.mnt_root' 'r->mnt\.mnt_sb' 'p\.mnt = &r->mnt;' 'mnt_path\.mn
 	}
 done
 echo "sus_mount: KDP-aware vfsmount reads in place (RWC 120)"
+
+# RWC 121: a kprobe must not sit on a BTI landing pad.
+#
+# /proc/modules and /proc/kallsyms are served by seq_read_iter(), which calls the
+# seq_operations callback through a POINTER: `ldr x8, [op, #0x18] ; blr x8`.  This
+# kernel enforces BTI at EL1, so that blr is a BTYPE=c guarded branch and the
+# instruction at the target must be a landing pad - `bti c`/`bti jc` or
+# `paciasp`/`pacibsp`.  m_show and s_show both begin with `paciasp`.  Upstream's
+# probe was armed at byte 0, which replaces that landing pad with BRK, and the
+# first read of the file then dies: RWC 121 was `grep` reading /proc/modules,
+# "Internal error: Oops - BTI", pc = seq_read_iter+0x14c (the instruction after
+# the blr, i.e. LR) with x8 = m_show+0.  /proc/kallsyms carried the same landmine.
+#
+# (Direct branches are not BTI-checked, which is why the LSM probes are safe: the
+# security hook chain reaches SELinux through a CFI stub with a `b`.)
+#
+# The patch arms the probe on the first instruction AFTER the landing-pad prefix
+# and strips the PAC field out of LR before resuming, because `paciasp` has
+# already run and LR is signed at that point.  Only landing pads are skipped, so
+# no frame exists yet and leaving the function early is exactly "was not called".
+PATCH="$HERE/susfs-hide-syms-bti.patch"
+test -f "$PATCH" || { echo "::error::susfs-hide-syms-bti.patch is missing from the repository"; exit 1; }
+git -C "$SUSFS_SRC" apply --check "$PATCH" || {
+	echo "::error::susfs-hide-syms-bti.patch does not apply to this pin's kernel/susfs_hide_syms.c;"
+	echo "::error::RWC 121's fix would be silently absent. Rebase the patch on the new source."
+	exit 1
+}
+git -C "$SUSFS_SRC" apply "$PATCH"
+grep -q 'static int hide_syms_probe_point(unsigned long body' "$tp/susfs_hide_syms.c" || {
+	echo "::error::hide_syms_probe_point() did not land in susfs_hide_syms.c"; exit 1; }
+grep -q 'asm volatile(".inst 0xdac143e0"' "$tp/susfs_hide_syms.c" || {
+	echo "::error::the PAC strip (xpaci) did not land in susfs_hide_syms.c"; exit 1; }
+n=$(grep -c 'hide_syms_skip_caller(regs, hide_syms_' "$tp/susfs_hide_syms.c" || true)
+if [ "$n" -ne 3 ]; then
+	echo "::error::hide_syms_skip_caller(regs, ...) appears $n times, not the 3 skip sites the patch converts"
+	exit 1
+fi
+if grep -q 'regs->pc = regs->regs\[30\]' "$tp/susfs_hide_syms.c"; then
+	echo "::error::a probe still resumes through raw x30 - the landing-pad fix is incomplete"
+	exit 1
+fi
+echo "hide_syms: probes armed after the BTI landing pad (RWC 121)"

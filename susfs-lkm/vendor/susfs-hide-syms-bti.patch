@@ -1,0 +1,278 @@
+diff --git a/kernel/susfs_hide_syms.c b/kernel/susfs_hide_syms.c
+index b3b3e2184b17..317c0bc33e69 100644
+--- a/kernel/susfs_hide_syms.c
++++ b/kernel/susfs_hide_syms.c
+@@ -555,6 +555,116 @@ static atomic_t hide_layout_bad = ATOMIC_INIT(0);
+ static const struct seq_operations *kallsyms_op_target;
+ static const struct seq_operations *modules_op_target;
+ 
++/* ---- where a kprobe may sit on a BTI-guarded table callback (RWC 121) ----
++ * /proc/kallsyms and /proc/modules are served by seq_read_iter(), which calls the
++ * seq_operations callback through a POINTER:
++ *
++ *     ldr x8, [x8, #0x18]      ; op->show
++ *     blr x8
++ *
++ * This kernel enforces BTI at EL1, and a `blr` is a BTYPE=c guarded branch: the
++ * instruction at the target must be a landing pad (`bti c`/`bti jc`) or
++ * `paciasp`/`pacibsp`.  m_show and s_show both begin with `paciasp`.  A kprobe
++ * replaces the probed instruction with BRK, so a probe at offset 0 deletes that
++ * landing pad and the next read of the file panics: RWC 121 was `grep` reading
++ * /proc/modules - "Internal error: Oops - BTI", pc = seq_read_iter+0x14c (the
++ * instruction after the blr, i.e. LR), x8 = m_show+0.  Both probes carried this;
++ * /proc/kallsyms was the other one waiting to be read.
++ *
++ * Why the LSM probes are safe where these two are not: BTI checks only INDIRECT
++ * branches.  The security hook chain calls SELinux through a CFI stub and reaches
++ * the probed body with a `b`, so the body's first instruction being BRK never
++ * matters.  m_show/s_show have no such stub - the table holds their bodies and
++ * seq_read_iter reaches them with `blr`.
++ *
++ * The probe therefore goes on the first instruction AFTER the landing-pad prefix.
++ * Only landing pads are skipped, so no frame has been set up and leaving the
++ * function early is exactly "was never called".  paciasp has already run, though,
++ * so LR holds a PAC-signed value and the skip must strip it, not jump to it.
++ */
++#define SUSFS_INSN_BTI		0xd503241f
++#define SUSFS_INSN_BTI_C	0xd503245f
++#define SUSFS_INSN_BTI_J	0xd503249f
++#define SUSFS_INSN_BTI_JC	0xd50324df
++#define SUSFS_INSN_PACIASP	0xd503233f
++#define SUSFS_INSN_PACIBSP	0xd503237f
++
++/* Set by hide_syms_probe_point(): the probe point lies after a paciasp/pacibsp, so
++ * regs->regs[30] carries a signed return address. */
++static bool hide_syms_s_show_pac_lr;
++static bool hide_syms_m_show_pac_lr;
++
++static bool hide_syms_landing_pad(unsigned int insn)
++{
++	switch (insn) {
++	case SUSFS_INSN_BTI:
++	case SUSFS_INSN_BTI_C:
++	case SUSFS_INSN_BTI_J:
++	case SUSFS_INSN_BTI_JC:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool hide_syms_pac_pad(unsigned int insn)
++{
++	return insn == SUSFS_INSN_PACIASP || insn == SUSFS_INSN_PACIBSP;
++}
++
++/* XPACI: the strip form needs no key and no authentication - it is what turns the
++ * value paciasp left in LR back into the return address.  On a pointer that was
++ * never signed (pointer authentication off, so paciasp ran as a hint) it is the
++ * identity, so the same path serves both configs. */
++static noinline unsigned long hide_syms_strip_pac(unsigned long addr)
++{
++	register unsigned long val asm("x0") = addr;
++
++	asm volatile(".inst 0xdac143e0" : "+r" (val));	/* xpaci x0 */
++	return val;
++}
++
++/* Leave the probed callback as if it had been called and returned 0.  At the probe
++ * point no frame exists yet, so only PC (and the return value) may change. */
++static void hide_syms_skip_caller(struct pt_regs *regs, bool pac_lr)
++{
++	unsigned long lr = regs->regs[30];
++
++	regs->pc = pac_lr ? hide_syms_strip_pac(lr) : lr;
++}
++
++/* The address a kprobe may sit on without destroying the landing pad.  Refuses
++ * anything it cannot read or does not recognise: an unvalidated address is not
++ * probed - this layer is non-fatal, a panic is not. */
++static int hide_syms_probe_point(unsigned long body, unsigned long *probe, bool *pac_lr)
++{
++	unsigned int insn;
++	unsigned long pc = body;
++	bool signed_lr = false;
++	int i;
++
++	for (i = 0; i < 4; i++) {
++		if (copy_from_kernel_nofault(&insn, (void *)pc, sizeof(insn)))
++			return -EFAULT;
++		if (hide_syms_landing_pad(insn)) {
++			pc += sizeof(insn);
++			continue;
++		}
++		if (hide_syms_pac_pad(insn)) {
++			signed_lr = true;
++			pc += sizeof(insn);
++			continue;
++		}
++		break;
++	}
++	if (i == 4)
++		return -EINVAL;		/* four landing pads and no body: not a function prologue */
++
++	*probe = pc;
++	*pac_lr = signed_lr;
++	return 0;
++}
++
+ /* Is this really a kernel struct kallsym_iter?  Two facts are always true of one: kallsyms
+  * fills `type` from its own alphabet, and `name` is NUL-terminated within the field.
+  * With this gate the string walk below is bounded either way, and a
+@@ -600,13 +710,13 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
+ 	if (name_should_hide(iter->name)) {
+ 		atomic_inc(&hide_hit_count);
+ 		regs->regs[0] = 0;              /* s_show returns 0 */
+-		regs->pc = regs->regs[30];      /* skip the line */
++		hide_syms_skip_caller(regs, hide_syms_s_show_pac_lr);	/* skip the line */
+ 		return 1;
+ 	}
+ 	if (iter->module_name[0] && hide_module_name_match(iter->module_name)) {
+ 		atomic_inc(&n_kallsyms_mod_skipped);
+ 		regs->regs[0] = 0;
+-		regs->pc = regs->regs[30];
++		hide_syms_skip_caller(regs, hide_syms_s_show_pac_lr);
+ 		return 1;
+ 	}
+ 	return 0;
+@@ -617,8 +727,11 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
+  * kallsyms' own callback - and the handler reads m->private as struct kallsym_iter *.  The probe is
+  * therefore armed on the address the kallsyms_op table itself holds, after validating that it is the
+  * body of a function named s_show (hide_syms_resolve_show()).  A raw kallsyms_op.show address probe
+- * used to crash the device on the first read of /proc/kallsyms; the cause was never established,
+- * which is why the body is validated rather than assuming every mismatch is a CFI jump-table thunk.
++ * DID crash the device on the first read of /proc/kallsyms, and the cause is now known: the probe
++ * replaced the callback's `paciasp` landing pad, and seq_read_iter reaches table callbacks with a
++ * `blr`, which BTI checks (RWC 121, m_show).  hide_syms_probe_point() therefore arms the probe after
++ * the landing pad instead of on it; the cause is not a CFI thunk mismatch, which is why the body is
++ * still validated before it is probed at all.
+  *
+  * Validation failure falls back to registration BY NAME, not to doing nothing: that path was
+  * measured to filter kallsyms on one device (grep -cE 'susfs_|ksu_' /proc/kallsyms went 257 -> 0),
+@@ -655,7 +768,7 @@ static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
+ 
+ 	atomic_inc(&n_modlines_skipped);
+ 	regs_set_return_value(regs, 0);		/* no output for this entry */
+-	regs->pc = regs->regs[30];
++	hide_syms_skip_caller(regs, hide_syms_m_show_pac_lr);
+ 	return 1;
+ }
+ 
+@@ -685,13 +798,15 @@ static bool m_show_registered;
+  * registering by name rather than arming an unvalidated address. */
+ static int __nocfi noinline hide_syms_resolve_show(struct kprobe *kp,
+ 		const char *table_name, const char *symbol_name,
+-		const struct seq_operations **table_out)
++		const struct seq_operations **table_out, bool *pac_lr)
+ {
+ 	const struct seq_operations *op;
+ 	unsigned long addr = find_kernel_symbol_exact(table_name);
+-	unsigned long show, target, pc;
++	unsigned long show, target, probe, pc;
++	int rc;
+ 
+ 	*table_out = NULL;
++	*pac_lr = false;
+ 	if (!addr)
+ 		return -ENOENT;
+ 	op = (const struct seq_operations *)addr;
+@@ -721,15 +836,46 @@ static int __nocfi noinline hide_syms_resolve_show(struct kprobe *kp,
+ 				table_name, (void *)show, (void *)target);
+ 	}
+ 
+-	kp->addr = (kprobe_opcode_t *)target;
++	/* The landing pad is not optional: a probe on it turns the next indirect call into
++	 * an Oops - BTI (RWC 121), so an address this function cannot classify is not probed. */
++	rc = hide_syms_probe_point(target, &probe, pac_lr);
++	if (rc)
++		return rc;
++
++	kp->addr = (kprobe_opcode_t *)probe;
+ 	*table_out = op;
+-	SUSFS_LOGI("susfs_hide_syms: %s.show=%px, probe body=%px\n",
+-			table_name, (void *)show, (void *)target);
++	SUSFS_LOGI("susfs_hide_syms: %s.show=%px, probe body=%px, probe at %px%s\n",
++			table_name, (void *)show, (void *)target, (void *)kp->addr,
++			*pac_lr ? " (after paciasp; the skip strips PAC)" : "");
+ 	return 0;
+ }
+ 
+ static bool hide_registered;
+ 
++/* The pessimistic path: the table value could not be validated, so the name decides.
++ * Resolved here rather than left to register_kprobe(), because the probe point has to
++ * skip the landing pad there too and the kernel's own .symbol_name resolution has no
++ * way to say "four bytes in".  Neither field may be set: the pair is what kprobe
++ * refuses (see susfs_kprobe.h). */
++static int hide_syms_resolve_by_name(struct kprobe *kp, const char *symbol_name,
++		bool *pac_lr)
++{
++	unsigned long addr = find_kernel_symbol_exact(symbol_name);
++	unsigned long probe;
++	int rc;
++
++	kp->addr = NULL;
++	kp->symbol_name = NULL;
++	*pac_lr = false;
++	if (!addr)
++		return -ENOENT;
++	rc = hide_syms_probe_point(addr, &probe, pac_lr);
++	if (rc)
++		return rc;
++	kp->addr = (kprobe_opcode_t *)probe;
++	return 0;
++}
++
+ int susfs_hide_syms_init(void)
+ {
+ 	int rc;
+@@ -758,19 +904,21 @@ int susfs_hide_syms_init(void)
+ 	 * again: on the identity path susfs_kp_forget_addr() leaves neither .addr nor .symbol_name
+ 	 * set, and the kernel answers -EINVAL for that combination (see susfs_kprobe.h). */
+ 	rc = hide_syms_resolve_show(&kp_s_show, "kallsyms_op", "s_show",
+-			&kallsyms_op_target);
++			&kallsyms_op_target, &hide_syms_s_show_pac_lr);
+ 	if (rc) {
+ 		/* Identity resolution failed: the table is not there, or its .show is not the body of a
+-		 * function named s_show (see hide_syms_resolve_show()).  Register BY NAME instead of
++		 * function named s_show (see hide_syms_resolve_show()).  Resolve BY NAME instead of
+ 		 * hiding nothing - the name-based path was measured to work on a device where the table
+ 		 * check does not.  kallsyms_op_target stays NULL, which is how the handler knows the
+-		 * m->op identity check is off and that hide_syms_iter_plausible() is the only gate; and
+-		 * .addr is cleared explicitly so the two fields are never set at once (that pair is what
+-		 * the kernel refuses with -EINVAL). */
++		 * m->op identity check is off and that hide_syms_iter_plausible() is the only gate. */
+ 		SUSFS_LOGI("susfs_hide_syms: kallsyms_op.show could not be validated (%d) - arming s_show BY NAME instead: the m->op check is OFF for this probe, so hide_syms_iter_plausible() is the only gate (if the name selects another s_show, that file can lose a line, and kallsyms hiding stays off)\n",
+ 				rc);
+-		kp_s_show.addr = NULL;
+-		kp_s_show.symbol_name = "s_show";
++		rc = hide_syms_resolve_by_name(&kp_s_show, "s_show", &hide_syms_s_show_pac_lr);
++		if (rc) {
++			pr_warn("susfs_hide_syms: no probeable s_show by name either (%d) - /proc/kallsyms keeps listing susfs_/ksu_ symbols\n",
++					rc);
++			return rc;
++		}
+ 	}
+ 	rc = register_kprobe(&kp_s_show);
+ 	if (rc) {
+@@ -788,13 +936,17 @@ int susfs_hide_syms_init(void)
+ 
+ 	/* Separate probe, separate failure: hiding symbol names and hiding module entries are independent. */
+ 	rc = hide_syms_resolve_show(&kp_m_show, "modules_op", "m_show",
+-			&modules_op_target);
++			&modules_op_target, &hide_syms_m_show_pac_lr);
+ 	if (rc) {
+ 		/* Same fallback as s_show, same reason: by name, with modules_op_target left NULL. */
+ 		SUSFS_LOGI("susfs_hide_syms: modules_op.show could not be validated (%d) - arming m_show BY NAME instead\n",
+ 				rc);
+-		kp_m_show.addr = NULL;
+-		kp_m_show.symbol_name = "m_show";
++		rc = hide_syms_resolve_by_name(&kp_m_show, "m_show", &hide_syms_m_show_pac_lr);
++		if (rc) {
++			pr_warn("susfs_hide_syms: no probeable m_show by name either (%d) - /proc/modules keeps listing the modules in hide_modules\n",
++					rc);
++			return rc;
++		}
+ 	}
+ 	rc = register_kprobe(&kp_m_show);
+ 	if (rc) {

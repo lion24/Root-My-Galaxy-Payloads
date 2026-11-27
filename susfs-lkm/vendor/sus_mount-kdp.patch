@@ -1,0 +1,157 @@
+diff --git a/kernel/sus_mount.c b/kernel/sus_mount.c
+index 4567d374006b..0aa44b08141a 100644
+--- a/kernel/sus_mount.c
++++ b/kernel/sus_mount.c
+@@ -336,6 +336,29 @@ static __nocfi char *sus_mount_d_path(const struct path *path, char *buf, int bu
+     return pfn_d_path(path, buf, buflen);
+ }
+ 
++/* Samsung's CONFIG_KDP_NS splits a mount into two allocations: the fields live in
++ * struct mount (the object the ns->list walk reaches), and the vfsmount details
++ * (mnt_root / mnt_sb / mnt_flags) live in a separate struct kdp_vfsmount reached
++ * through the hidden pointer behind the mount's fields.  Sourced from the device's
++ * own BTF (S916BXXUAGZIF: struct kdp_mount 360 bytes, mnt at 352 = 0x160; struct
++ * kdp_vfsmount 72 bytes, bp_mount at 64) and from this tree's fs/mount.h +
++ * fs/namespace.c, which read every vfsmount field as ((struct kdp_mount *)mnt)->mnt
++ * when CONFIG_KDP_NS is set.  A real fs/namespace.c mount never initializes the
++ * embedded `mnt` copy under KDP: crash RWC 120 (d_path given a NULL dentry read
++ * back from r+0x20 on the same mount whose real kdp vfsmount was live) is exactly
++ * that shape.  The seq_file cursor is the one exception: proc_namespace.c sets
++ * cursor.mnt.mnt_flags = MNT_CURSOR on the EMBEDDED copy and its kdp pointer is
++ * past the end of struct proc_mounts (never deref it), which is why the cursor
++ * test keeps reading r->mnt.mnt_flags while real-mount field reads go through here. */
++static inline struct vfsmount *sus_mount_mnt_of(struct mount *r)
++{
++#ifdef CONFIG_KDP_NS
++    return ((struct kdp_mount *)r)->mnt;
++#else
++    return &r->mnt;
++#endif
++}
++
+ /* Effective threshold: clamped on every read too, because the sysfs knob can be
+  * written at any time (init/enable also write the clamped value back). */
+ static unsigned long sus_mount_min_mnt_id(void)
+@@ -566,7 +589,7 @@ static atomic_t n_dbg_logged = ATOMIC_INIT(0);
+ static void sus_mount_ident_add(struct mount *r)
+ {
+     const char *devname = r->mnt_devname;
+-    struct dentry *root = r->mnt.mnt_root;
++    struct dentry *root = sus_mount_mnt_of(r)->mnt_root;
+     unsigned long ino;
+     unsigned long flags;
+     int i, slot = -1;
+@@ -580,7 +603,7 @@ static void sus_mount_ident_add(struct mount *r)
+     spin_lock_irqsave(&ident_lock, flags);
+     /* Re-check under the lock so two scans cannot both append; a re-enable finds them here. */
+     for (i = 0; i < n_ident; i++) {
+-        if (mount_ident[i].s_dev == r->mnt.mnt_sb->s_dev &&
++        if (mount_ident[i].s_dev == sus_mount_mnt_of(r)->mnt_sb->s_dev &&
+             mount_ident[i].root_ino == ino)
+             goto out;
+         if (!mount_ident[i].root_ino && slot < 0)
+@@ -601,7 +624,7 @@ static void sus_mount_ident_add(struct mount *r)
+     {
+         struct sus_mount_ident *e = &mount_ident[slot];
+ 
+-        e->s_dev = r->mnt.mnt_sb->s_dev;
++        e->s_dev = sus_mount_mnt_of(r)->mnt_sb->s_dev;
+         e->devname_is_path = devname && devname[0] == '/';
+         if (e->devname_is_path) {
+             e->devname_truncated = strlen(devname) >= sizeof(e->devname);
+@@ -625,7 +648,7 @@ static bool sus_mount_ident_match(struct mount *r)
+ {
+     int n = smp_load_acquire(&n_ident);
+     const char *devname = r->mnt_devname;
+-    struct dentry *root = r->mnt.mnt_root;
++    struct dentry *root = sus_mount_mnt_of(r)->mnt_root;
+     unsigned long ino = (root && root->d_inode) ? root->d_inode->i_ino : 0;
+     int i;
+ 
+@@ -633,7 +656,7 @@ static bool sus_mount_ident_match(struct mount *r)
+         const struct sus_mount_ident *e = &mount_ident[i];
+         unsigned long e_ino = smp_load_acquire(&e->root_ino);
+ 
+-        if (e_ino && e_ino == ino && e->s_dev == r->mnt.mnt_sb->s_dev)
++        if (e_ino && e_ino == ino && e->s_dev == sus_mount_mnt_of(r)->mnt_sb->s_dev)
+             return true;
+         if (e->devname_is_path && devname &&
+             (e->devname_truncated
+@@ -729,7 +752,7 @@ static void sus_mount_note_id(struct mount *r)
+         return;
+     shown = sus_mount_shown_id_from(r);
+     if (shown > 0 && shown != (int)r->mnt_id) {
+-        sus_mount_idmap_add((int)r->mnt_id, shown, r->mnt.mnt_sb->s_dev);
++        sus_mount_idmap_add((int)r->mnt_id, shown, sus_mount_mnt_of(r)->mnt_sb->s_dev);
+         atomic_inc(&n_ident_learned);
+     }
+ }
+@@ -830,7 +853,7 @@ static void sus_mount_learn_ns(struct mnt_namespace *ns)
+             continue;
+         shown = sus_mount_shown_id_from(r);
+         if (shown > 0 && shown != (int)r->mnt_id) {
+-            sus_mount_idmap_add((int)r->mnt_id, shown, r->mnt.mnt_sb->s_dev);
++            sus_mount_idmap_add((int)r->mnt_id, shown, sus_mount_mnt_of(r)->mnt_sb->s_dev);
+             learned++;
+         }
+     }
+@@ -896,7 +919,7 @@ static int sus_mount_learn_ns_walk(struct mnt_namespace *ns)
+             continue;
+         shown = sus_mount_shown_id_from(r);
+         if (shown > 0 && shown != (int)r->mnt_id) {
+-            sus_mount_idmap_add((int)r->mnt_id, shown, r->mnt.mnt_sb->s_dev);
++            sus_mount_idmap_add((int)r->mnt_id, shown, sus_mount_mnt_of(r)->mnt_sb->s_dev);
+             learned++;
+         }
+     }
+@@ -1048,8 +1071,8 @@ static bool sus_mount_should_record(struct mount *r, char *buf, int buflen, char
+     }
+     if (!pfn_d_path)
+         return false;
+-    p.mnt = &r->mnt;
+-    p.dentry = r->mnt.mnt_root;
++    p.mnt = sus_mount_mnt_of(r);
++    p.dentry = sus_mount_mnt_of(r)->mnt_root;
+     dp = sus_mount_d_path(&p, buf, buflen);
+     if (IS_ERR_OR_NULL(dp)) {
+         atomic_inc(&n_newmnt_pathfail);
+@@ -1499,8 +1522,8 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
+          * what sus_mount_is_ours() compared. */
+         if (mount_dbg && atomic_inc_return(&n_dbg_logged) <= 40)
+             SUSFS_LOGI("sus_mount: hook: NOT ours id=%d s_dev=%u root=%px devname=%s\n",
+-                    r->mnt_id, (unsigned int)r->mnt.mnt_sb->s_dev,
+-                    r->mnt.mnt_root, r->mnt_devname ? r->mnt_devname : "none");
++                    r->mnt_id, (unsigned int)sus_mount_mnt_of(r)->mnt_sb->s_dev,
++                    sus_mount_mnt_of(r)->mnt_root, r->mnt_devname ? r->mnt_devname : "none");
+         return 0;
+     }
+     /* domain gate, upstream patch:1561-1585: the su/ksu domain is not
+@@ -2188,7 +2211,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long
+          * next namespace (measured: 2000000000 here, 1111 in the zygote's). */
+         if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN) {
+             n_skipped_marked++;
+-            sus_mount_idmap_add((int)r->mnt_id, sus_mount_shown_id(r), r->mnt.mnt_sb->s_dev);
++            sus_mount_idmap_add((int)r->mnt_id, sus_mount_shown_id(r), sus_mount_mnt_of(r)->mnt_sb->s_dev);
+             sus_mount_ident_add(r);
+             continue;
+         }
+@@ -2200,8 +2223,8 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long
+             /* meta-overlayfs style: the source is /dev/block/loopNN, so only the
+              * mount point says /data/adb/... .  d_path() of {mnt, mnt_root} is the
+              * mountpoint path show_mountinfo() prints. */
+-            mnt_path.mnt = &r->mnt;
+-            mnt_path.dentry = r->mnt.mnt_root;
++            mnt_path.mnt = sus_mount_mnt_of(r);
++            mnt_path.dentry = sus_mount_mnt_of(r)->mnt_root;
+             dp = sus_mount_d_path(&mnt_path, buf, PATH_MAX);
+             /* Diagnostic while the matching rule is being validated: the first few
+              * mounts show what d_path() actually renders for them. */
+@@ -2236,7 +2259,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long
+         /* After the id is replaced, exactly like upstream: the climb starts at a
+          * mount that now carries a KSU-range id and stops at the first ancestor
+          * that does not - i.e. the id mountinfo still prints for the host. */
+-        sus_mount_idmap_add(new_id, sus_mount_shown_id(r), r->mnt.mnt_sb->s_dev);
++        sus_mount_idmap_add(new_id, sus_mount_shown_id(r), sus_mount_mnt_of(r)->mnt_sb->s_dev);
+         /* And the identity, so the same filesystem mounted in another namespace
+          * (where this scan cannot reach) is recognised by the hide hooks. */
+         sus_mount_ident_add(r);

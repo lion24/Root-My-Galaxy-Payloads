@@ -112,3 +112,46 @@ sed -i 's/^\([[:space:]]*\)fsnotify_lifetime\.o btf_layout\.o sus_dirent\.o$/\1f
 grep -q 'susfs_kp_stat\.o' "$tp/Makefile" || {
 	echo "::error::the Makefile does not build susfs_kp_stat.o"; exit 1; }
 echo "kp_stat overlay: in place, post-processing on kretprobes"
+
+# RWC 120: Samsung's CONFIG_KDP_NS splits `struct mount`.
+#
+# Under CONFIG_KDP_NS (this phone's own config carries it) a mount is
+# `struct kdp_mount { struct mount mount; struct vfsmount *mnt; }`, and the vfsmount
+# fields (mnt_root / mnt_sb / mnt_flags) live in the separately allocated
+# `struct kdp_vfsmount`. fs/namespace.c reads every one of them through
+# `((struct kdp_mount *)mnt)->mnt`; the embedded copy at mount+0x20 is never
+# initialized for a real mount. Upstream's module reads them from the embedded
+# copy, so its d_path() call got a NULL dentry and the phone died in the first
+# namespace the marking scan reached: `sus_mount_mark_ksu_mounts+0x578` ->
+# `d_path+0x30` (RWC 120). The device BTF is the evidence: `struct kdp_mount`
+# is 360 bytes with `mnt` at 0x160, `struct kdp_vfsmount` is 72 bytes with
+# `bp_mount` at 0x40.
+#
+# The patch routes those reads through sus_mount_mnt_of(), which returns the kdp
+# pointer when the config says KDP and `&r->mnt` otherwise - the #else branch is
+# the old behaviour verbatim, so the patch is inert on a non-KDP config. The
+# cursor test keeps reading the embedded mnt_flags, exactly like the kernel's own
+# mnt_is_cursor(): proc_namespace.c sets MNT_CURSOR on the embedded copy, and a
+# cursor's kdp pointer is past the end of its object and must never be read.
+PATCH="$HERE/sus_mount-kdp.patch"
+test -f "$PATCH" || { echo "::error::sus_mount-kdp.patch is missing from the repository"; exit 1; }
+git -C "$SUSFS_SRC" apply --check "$PATCH" || {
+	echo "::error::sus_mount-kdp.patch does not apply to this pin's kernel/sus_mount.c;"
+	echo "::error::RWC 120's fix would be silently absent. Rebase the patch on the new source."
+	exit 1
+}
+git -C "$SUSFS_SRC" apply "$PATCH"
+grep -q 'static inline struct vfsmount \*sus_mount_mnt_of(struct mount \*r)' "$tp/sus_mount.c" || {
+	echo "::error::sus_mount_mnt_of() did not land in sus_mount.c"; exit 1; }
+n=$(grep -c 'sus_mount_mnt_of(r)' "$tp/sus_mount.c" || true)
+test "$n" -eq 16 || {
+	echo "::error::sus_mount_mnt_of(r) appears $n times, not the 16 field reads the patch converts"
+	exit 1
+}
+for pat in 'r->mnt\.mnt_root' 'r->mnt\.mnt_sb' 'p\.mnt = &r->mnt;' 'mnt_path\.mnt = &r->mnt;'; do
+	grep -q "$pat" "$tp/sus_mount.c" && {
+		echo "::error::sus_mount.c still reads an embedded vfsmount field ($pat) - the KDP fix is incomplete"
+		exit 1
+	}
+done
+echo "sus_mount: KDP-aware vfsmount reads in place (RWC 120)"

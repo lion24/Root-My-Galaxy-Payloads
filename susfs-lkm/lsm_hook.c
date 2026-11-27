@@ -82,6 +82,23 @@
 #include "symbol_resolver.h"
 
 /*
+ * The probe-point policy (RWC 121/123): a kprobe on a function reached through a pointer must not
+ * replace its byte 0, because byte 0 is the BTI landing pad the indirect branch checks and replacing
+ * it panics on the next such call.  The header is carried by the vendor patch series; a tree without
+ * it (upstream's own sources) falls back to the old address-only arm, so every place that depends on
+ * the policy is behind SUSFS_LSM_BTI and that fallback still builds.
+ */
+#if defined(__has_include)
+#  if __has_include("susfs_bti.h")
+#include "susfs_bti.h"
+#define SUSFS_LSM_BTI 1
+#  endif
+#endif
+#ifndef SUSFS_LSM_BTI
+#define SUSFS_LSM_BTI 0
+#endif
+
+/*
  * Diagnostics, kept from the two reboots that produced them.
  *
  * `lsm_max=N` installs at most N probes and `lsm_off=1` installs none, so the layer can be run as a
@@ -110,6 +127,7 @@ struct susfs_slot {
 	const char *symbol;
 	struct kprobe probe;
 	const struct ksu_lsm_hook *hook;
+	bool pac_lr;		/* probe sits past the function's PAC instruction (see susfs_bti.h) */
 };
 
 /*
@@ -173,6 +191,14 @@ static int __nocfi susfs_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	}
 
 	this_cpu_write(susfs_verdict, verdict);
+#if SUSFS_LSM_BTI
+	/*
+	 * The probe point is PAST the function's paciasp (byte 0 has to stay the landing pad), so LR
+	 * is already signed when this runs and the trampoline's `ret` would leave to a signed address.
+	 * No frame exists yet - the point is the first body instruction - so xpaci is the whole unwind.
+	 */
+	regs->regs[30] = susfs_bti_strip_pac(regs->regs[30]);
+#endif
 	instruction_pointer_set(regs, (unsigned long)susfs_tramp_deny);
 	return 1;
 }
@@ -246,10 +272,20 @@ static bool susfs_skip_named(const char *member)
 }
 
 /* Address first, name second - `sel_hide_register_probe`'s rule, and the reason it exists: a kernel
- * that refuses a probe placed by raw address accepts the same probe named through kallsyms. */
+ * that refuses a probe placed by raw address accepts the same probe named through kallsyms.
+ *
+ * The address is not the symbol's byte 0 any more: `call_int_hook` reaches these functions through
+ * `blr`, so byte 0 is their BTI landing pad, and replacing it turns the next permission check into
+ * "Oops - BTI" (RWC 121/123).  susfs_bti.h picks the first point after the pads and the PAC
+ * instruction, and REFUSES the member when byte 0 is not a pad - a guess there costs a boot. */
 static int susfs_register_probe(struct susfs_slot *slot)
 {
 	unsigned long target = find_kernel_symbol_exact(slot->symbol);
+	unsigned long point = target;
+	bool pac_lr = false;
+#if SUSFS_LSM_BTI
+	unsigned int point_off = 0;
+#endif
 	int ret;
 
 	if (!target) {
@@ -258,20 +294,49 @@ static int susfs_register_probe(struct susfs_slot *slot)
 		return -ENOENT;
 	}
 
-	slot->probe.addr = (kprobe_opcode_t *)target;
+	slot->pac_lr = false;
+#if SUSFS_LSM_BTI
+	ret = susfs_bti_probe_point_pad_entry(slot->symbol, target, &point, &pac_lr);
+	if (ret) {
+		pr_err("lsm_hook: %s: %s has no landing-pad-safe probe point (%d) - refusing to arm it\n",
+		       slot->member, slot->symbol, ret);
+		return ret;
+	}
+	point_off = (unsigned int)(point - target);
+#endif
+
+	slot->probe.addr = (kprobe_opcode_t *)point;
 	ret = register_kprobe(&slot->probe);
 	if (ret == -EINVAL) {
 		pr_warn("lsm_hook: %s: probe on %s by address refused (%d), retrying by name\n",
 			slot->member, slot->symbol, ret);
 		slot->probe.addr = NULL;
+#if SUSFS_LSM_BTI
+		/* By name, the offset is what keeps the probe off byte 0: the same point. */
+		slot->probe.offset = point_off;
+#endif
 		slot->probe.symbol_name = slot->symbol;
 		ret = register_kprobe(&slot->probe);
 		slot->probe.symbol_name = NULL;
 	}
 	if (ret) {
 		slot->probe.addr = NULL;
+		slot->probe.offset = 0;
 		return ret;
 	}
+#if SUSFS_LSM_BTI
+	/* register_kprobe() reports success even when arch_arm_kprobe()'s text write was dropped. */
+	ret = susfs_bti_verify_armed(&slot->probe);
+	if (ret) {
+		/* Unregister BEFORE clearing .addr: unregister_kprobe() walks only a probe whose
+		 * addr is still set (kernel/susfs_kprobe.h). */
+		unregister_kprobe(&slot->probe);
+		slot->probe.addr = NULL;
+		slot->probe.offset = 0;
+		return ret;
+	}
+#endif
+	slot->pac_lr = pac_lr;
 	return 0;
 }
 
@@ -343,7 +408,9 @@ int ksu_register_lsm_hook(struct ksu_lsm_hook *hook)
 	susfs_installed++;
 	mutex_unlock(&susfs_slots_lock);
 
-	SUSFS_LOGI("lsm_hook: %s: kprobe armed on %s\n", hook->head_name ?: "unknown", slot->symbol);
+	SUSFS_LOGI("lsm_hook: %s: kprobe armed on %s (%px%s)\n", hook->head_name ?: "unknown", slot->symbol,
+		   (void *)slot->probe.addr,
+		   slot->pac_lr ? ", past its PAC prologue - the deny path strips it" : "");
 	return 0;
 }
 
@@ -394,6 +461,14 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
 
 void ksu_lsm_hook_init(void)
 {
+#if SUSFS_LSM_BTI
+	int disarmed = susfs_bti_kprobes_disarmed();
+
+	if (disarmed != 0)
+		pr_warn("lsm_hook: kprobes_all_disarmed=%d - %s\n", disarmed,
+			disarmed < 0 ? "the switch could not be resolved, so a silent non-arm cannot be ruled out"
+				     : "register_kprobe will report success without arming anything");
+#endif
 	SUSFS_LOGI("lsm_hook: install path is kprobe-based - security_hook_heads is read-only here, and a "
 		   "breakpoint is accepted where a write is not\n");
 }

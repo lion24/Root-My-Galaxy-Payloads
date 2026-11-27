@@ -168,8 +168,10 @@ echo "sus_mount: KDP-aware vfsmount reads in place (RWC 120)"
 # "Internal error: Oops - BTI", pc = seq_read_iter+0x14c (the instruction after
 # the blr, i.e. LR) with x8 = m_show+0.  /proc/kallsyms carried the same landmine.
 #
-# (Direct branches are not BTI-checked, which is why the LSM probes are safe: the
-# security hook chain reaches SELinux through a CFI stub with a `b`.)
+# (Direct branches are not BTI-checked.  The LSM probes are NOT in that class, whatever
+# upstream's comment said: measured at security_inode_permission+0x34 this kernel does
+# `ldr x8,[x21,#0x18] ; blr x8`, an indirect branch whose target must be a landing pad.  They
+# therefore go through the pad-entry rule in lsm_hook.c / susfs_bti.h and never byte 0.)
 #
 # The patch arms the probe on the first instruction AFTER the landing-pad prefix
 # and strips the PAC field out of LR before resuming, because `paciasp` has

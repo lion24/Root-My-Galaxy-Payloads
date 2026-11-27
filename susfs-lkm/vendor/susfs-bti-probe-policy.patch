@@ -535,16 +535,39 @@
  	.pre_handler = reboot_pre,
  };
  
-@@ -357,13 +365,21 @@
+@@ -350,20 +358,52 @@
+ 
+ int susfs_supercall_init(void)
+ {
+-	int rc;
++	int rc, disarmed;
+ 
+ 	susfs_abi_layout_check();
+ 
  	/* One-shot: armed here and dropped in susfs_supercall_exit() only, so no retry can ever meet a
  	 * stale .addr.  This layer is fatal, so a failure refuses the load instead of leaving the probe
- 	 * half-armed - which is why it is exempt from the reset rule in kernel/susfs_kprobe.h. */
-+	rc = susfs_bti_arm_kprobe(&reboot_kp);
+-	 * half-armed - which is why it is exempt from the reset rule in kernel/susfs_kprobe.h. */
++	 * half-armed - which is why it is exempt from the reset rule in kernel/susfs_kprobe.h.
++	 *
++	 * invoke_syscall() reaches __arm64_sys_reboot through sys_call_table with `blr x20`, so this is
++	 * a POINTER-reached entry: byte 0 must be the landing pad observed to be there (RWC 123), and
++	 * the classifier refuses rather than arms +0 on a word it cannot confirm. */
++	rc = susfs_bti_arm_kprobe_pad_entry(&reboot_kp);
 +	if (rc) {
-+		pr_warn("susfs supercall: __arm64_sys_reboot is not probeable after its landing pad (%d) - refusing to arm the supercall ABI\n",
++		pr_warn("susfs supercall: __arm64_sys_reboot has no usable point past its landing pad (%d) - refusing to arm the supercall ABI\n",
 +			rc);
 +		return rc;
 +	}
++
++	/* A set switch makes register_kprobe() return 0 without arming anything; the flag defaults
++	 * false and init_kprobes() clears it, so a non-zero answer means this boot cannot probe. */
++	disarmed = susfs_bti_kprobes_disarmed();
++	if (disarmed != 0)
++		pr_warn("susfs supercall: kprobes_all_disarmed=%d before register_kprobe - %s\n",
++			disarmed,
++			disarmed < 0 ? "the switch could not be resolved, so a silent non-arm cannot be ruled out"
++				     : "register_kprobe will return 0 without arming anything");
++
  	rc = register_kprobe(&reboot_kp);
  	if (rc) {
 +		susfs_kp_forget_addr(&reboot_kp);
@@ -553,6 +576,16 @@
  	}
  	sc_registered = true;
 -	SUSFS_LOGI("susfs supercall: armed (reboot ABI, version " SUSFS_VERSION_STR ")\n");
++	/* register_kprobe() success is not proof the breakpoint landed: arch_arm_kprobe() discards the
++	 * text-write result (see susfs_bti.h).  Set the flag first so the fatal layer's unwind can
++	 * still unregister this probe. */
++	rc = susfs_bti_verify_armed(&reboot_kp);
++	if (rc) {
++		susfs_bti_log_words(reboot_kp.symbol_name, (unsigned long)reboot_kp.addr);
++		pr_warn("susfs supercall: __arm64_sys_reboot @%px reports registered but is not armed (%d) - refusing the load\n",
++			(void *)reboot_kp.addr, rc);
++		return rc;
++	}
 +	SUSFS_LOGI("susfs supercall: armed (reboot ABI, version " SUSFS_VERSION_STR ", probe=%px)\n",
 +		   (void *)reboot_kp.addr);
  	return 0;
@@ -625,7 +658,7 @@
  		/* The failure that matters is reported to the caller, but the address the kernel
 --- /dev/null
 +++ b/kernel/susfs_bti.h
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,496 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * susfs_bti.h - where a probe may sit on this kernel's functions.
@@ -676,6 +709,30 @@
 + *      kretprobe on a paciasp-at-0 entry -> arm at byte 0 only when it is direct-call only
 + *      kretprobe on a table/pointer-reached entry -> refuse; there is no safe offset
 + *
++ * A KPROBE on a pointer-reached entry follows the kretprobe rule, not the kprobe one.  That is the
++ * class RWC 123 hit: the classifier moved the probe past the pad for `seq_read_iter`'s show callbacks
++ * but left `__arm64_sys_reboot` at +0 because the word it read at byte 0 was not the pad it
++ * expected, and a "+0" from a wrong read is indistinguishable in the log from a correct "+0" -
++ * while the cost is a panic on the next indirect call.  So an entry a table or a resolved pointer
++ * reaches is now REFUSED (-EOPNOTSUPP) unless the classifier actually SAW a landing pad at byte 0
++ * (susfs_bti_probe_point_pad_entry()).  Byte 0 is the only place that check can be made: the pad
++ * has to survive, and moving past it is the whole point.
++ *
++ * Two more statements the module can no longer omit, both because the kernel reports success
++ * without doing what was asked:
++ *
++ *      - register_kprobe() returns 0 while arming nothing when `kprobes_all_disarmed` is set (a
++ *        boot parameter or a runtime toggle) or when kp->flags has the disable bits.  Callers log
++ *        susfs_bti_kprobes_disarmed() next to their result.
++ *      - arch_arm_kprobe() returns void and DISCARDS the text-write result, so a write the
++ *        hypervisor refuses is a silent non-arm that register_kprobe() still reports as 0.
++ *        susfs_bti_verify_armed() reads the armed site back and requires the BRK kprobes should
++ *        have written there.
++ *
++ * Every "+0" answer and every refusal prints the raw words the classifier read
++ * (susfs_bti_log_words()), because a read that returned zeros, a stale `nop` or a BRK left behind
++ * all answer "+0" and cannot be told apart from the log without them.
++ *
 + * "Indirect target" is not derivable from the function itself: paciasp IS a landing pad, and most
 + * functions start with it whether or not anything calls them through a pointer.  Which functions
 + * are indirect targets was decided per call site from this kernel's disassembly (sys_call_table,
@@ -704,6 +761,14 @@
 +#define SUSFS_BTI_INSN_BTI_JC	0xd50324df
 +#define SUSFS_BTI_INSN_PACIASP	0xd503233f
 +#define SUSFS_BTI_INSN_PACIBSP	0xd503237f
++
++/* BRK #4: what arm64 kprobes writes over the probed instruction.  susfs_bti_verify_armed()
++ * requires exactly this word at kp->addr after a registration the kernel claims succeeded. */
++#define SUSFS_BTI_INSN_BRK		0xd4200080
++
++/* Stands in for a word copy_from_kernel_nofault() could not read, so a failed read is never
++ * mistaken for `brk #0`/`nop` in the evidence lines. */
++#define SUSFS_BTI_WORD_READ_FAILED	0xdeadbeefu
 +
 +/* bti (any form): a landing pad that no instruction-signing needs. */
 +static inline bool susfs_bti_landing_pad(unsigned int insn)
@@ -777,24 +842,60 @@
 +	regs->pc = susfs_bti_strip_pac(regs->regs[30]);
 +}
 +
++/* Print the four words actually read at @at.  Attached to every "+0" classification and to every
++ * refusal, because the classifier's answer is only meaningful next to the instructions it was
++ * derived from: a read that returned zeros, a stale `nop` and a BRK already installed all answer
++ * "+0".  A word that could not be read prints as SUSFS_BTI_WORD_READ_FAILED. */
++static inline void susfs_bti_log_words(const char *sym, unsigned long at)
++{
++	unsigned int w[4];
++	int i;
++
++	for (i = 0; i < 4; i++)
++		w[i] = SUSFS_BTI_WORD_READ_FAILED;
++	for (i = 0; i < 4; i++)
++		if (copy_from_kernel_nofault(&w[i], (void *)(at + i * sizeof(w[i])),
++					     sizeof(w[i])))
++			w[i] = SUSFS_BTI_WORD_READ_FAILED;
++	pr_info("susfs_bti: %s @%px words: %08x %08x %08x %08x\n", sym ?: "?", (void *)at,
++		w[0], w[1], w[2], w[3]);
++}
++
 +/* KPROBE point: the first instruction after the landing pads, an early-exit guard and the PAC
 + * instruction.  Skipping past paciasp is mandatory - a probe ON it would still delete the landing
-+ * pad - and the caller already starts from a fresh `.offset`, so this runs on every arm. */
-+static inline int susfs_bti_probe_point(unsigned long body, unsigned long *probe, bool *pac_lr)
++ * pad - and the caller already starts from a fresh `.offset`, so this runs on every arm.
++ *
++ * @entry_must_be_pad is the caller's statement that a table or a resolved pointer reaches this
++ * function's byte 0: then the only acceptable answer is one derived from a landing pad actually
++ * OBSERVED at byte 0, and anything else is refused rather than guessed.  @sym is only used in the
++ * evidence lines. */
++static inline int susfs_bti_probe_point_impl(const char *sym, unsigned long body,
++					     unsigned long *probe, bool *pac_lr,
++					     bool entry_must_be_pad)
 +{
-+	unsigned int insn;
++	unsigned int insn, first = SUSFS_BTI_WORD_READ_FAILED;
 +	unsigned long pc = body;
-+	bool signed_lr = false;
++	bool signed_lr = false, saw_pad = false;
 +	int i;
 +
 +	for (i = 0; i < 8; i++) {
-+		if (copy_from_kernel_nofault(&insn, (void *)pc, sizeof(insn)))
++		if (copy_from_kernel_nofault(&insn, (void *)pc, sizeof(insn))) {
++			susfs_bti_log_words(sym, body);
++			pr_warn("susfs_bti: %s: cannot read %px - not armed\n", sym ?: "?",
++				(void *)pc);
 +			return -EFAULT;
++		}
++		if (i == 0)
++			first = insn;
 +		if (susfs_bti_landing_pad(insn)) {
++			if (i == 0)
++				saw_pad = true;
 +			pc += sizeof(insn);
 +			continue;
 +		}
 +		if (susfs_bti_pac_pad(insn)) {
++			if (i == 0)
++				saw_pad = true;		/* paciasp IS a landing pad */
 +			signed_lr = true;
 +			pc += sizeof(insn);
 +			continue;
@@ -808,14 +909,52 @@
 +		}
 +		break;
 +	}
-+	if (i == 8)
-+		return -EINVAL;		/* eight pads/guards and no body: not a function entry */
-+	if (susfs_bti_unsteppable(insn))
-+		return -EOPNOTSUPP;	/* no point found that kprobes can single-step */
++	if (i == 8) {
++		/* eight pads/guards and no body: not a function entry */
++		susfs_bti_log_words(sym, body);
++		pr_warn("susfs_bti: %s: eight landing pads/guards and no body (first word %08x) - not a function entry, not armed\n",
++			sym ?: "?", first);
++		return -EINVAL;
++	}
++	if (entry_must_be_pad && !saw_pad) {
++		/* The failure RWC 123 cost a boot: a "+0" here replaces the landing pad an indirect
++		 * branch checks, so the arm is refused outright instead of trusting the answer. */
++		susfs_bti_log_words(sym, body);
++		pr_warn("susfs_bti: %s: byte 0 is %08x, not a BTI/PAC landing pad, but a table or a resolved pointer reaches this entry - arming anywhere (including +0) would break the indirect branch that reaches it; refused\n",
++			sym ?: "?", first);
++		return -EOPNOTSUPP;
++	}
++	if (susfs_bti_unsteppable(insn)) {
++		/* no point found that kprobes can single-step */
++		susfs_bti_log_words(sym, body);
++		pr_warn("susfs_bti: %s: the point after its prologue is %08x, which kprobes cannot single-step - not armed\n",
++			sym ?: "?", insn);
++		return -EOPNOTSUPP;
++	}
 +
 +	*probe = pc;
 +	*pac_lr = signed_lr;
++	/* A "+0" answer is a claim that byte 0 itself may be replaced, and a pointer-reached entry's
++	 * answer is a claim about byte 0's landing pad: print the words both rest on, so the next log
++	 * says what the classifier actually saw rather than only what it concluded. */
++	if (entry_must_be_pad || pc == body)
++		susfs_bti_log_words(sym, body);
 +	return 0;
++}
++
++/* Kprobe point for an entry NOT known to be pointer-reached: byte 0 may be used when it is the
++ * only steppable instruction (a leaf or direct-call function with no BTI prefix). */
++static inline int susfs_bti_probe_point(unsigned long body, unsigned long *probe, bool *pac_lr)
++{
++	return susfs_bti_probe_point_impl(NULL, body, probe, pac_lr, false);
++}
++
++/* Kprobe point for an entry that sys_call_table, a security_hook slot or an op->show reaches
++ * through a pointer: byte 0 must BE the observed landing pad, or the arm is refused. */
++static inline int susfs_bti_probe_point_pad_entry(const char *sym, unsigned long body,
++						  unsigned long *probe, bool *pac_lr)
++{
++	return susfs_bti_probe_point_impl(sym, body, probe, pac_lr, true);
 +}
 +
 +/* KRETPROBE point.  @probe_on_pac says the point is the paciasp itself (so the trampoline
@@ -871,7 +1010,7 @@
 + * .symbol_name), the offset is added exactly once by _kprobe_addr(), and the handlers print
 + * kp->symbol_name in their log lines.  .addr must be NULL on entry and after every failure - see
 + * susfs_kprobe.h for why a retry inherits it otherwise. */
-+static inline int susfs_bti_arm_kprobe(struct kprobe *kp)
++static inline int susfs_bti_arm_kprobe_impl(struct kprobe *kp, bool entry_must_be_pad)
 +{
 +	unsigned long body, probe;
 +	bool pac_lr = false;
@@ -889,7 +1028,7 @@
 +		return -ENOENT;
 +	}
 +
-+	rc = susfs_bti_probe_point(body, &probe, &pac_lr);
++	rc = susfs_bti_probe_point_impl(kp->symbol_name, body, &probe, &pac_lr, entry_must_be_pad);
 +	if (rc) {
 +		pr_warn("susfs_bti: %s+0 (%px) has no point kprobes may take after its landing pads (%d) - not armed\n",
 +			kp->symbol_name, (void *)body, rc);
@@ -900,6 +1039,62 @@
 +	SUSFS_LOGI("susfs_bti: %s body=%px probe=%px (+%u%s)\n",
 +		   kp->symbol_name, (void *)body, (void *)probe, kp->offset,
 +		   pac_lr ? ", past its PAC prologue - the resume strips it" : ", no landing pad was skipped");
++	if (entry_must_be_pad)
++		SUSFS_LOGI("susfs_bti: %s is pointer-reached and its byte 0 is a landing pad the probe leaves intact\n",
++			   kp->symbol_name);
++	return 0;
++}
++
++/* Arm a kprobe whose entry is not known to be reached through a pointer. */
++static inline int susfs_bti_arm_kprobe(struct kprobe *kp)
++{
++	return susfs_bti_arm_kprobe_impl(kp, false);
++}
++
++/* Arm a kprobe on an entry that sys_call_table, a security_hook slot or an op->show reaches
++ * through a pointer: refused unless byte 0 was OBSERVED to be a landing pad. */
++static inline int susfs_bti_arm_kprobe_pad_entry(struct kprobe *kp)
++{
++	return susfs_bti_arm_kprobe_impl(kp, true);
++}
++
++/* The kernel's global "every probe is disarmed" switch.  register_kprobe() checks it before it
++ * even looks at kp->flags and returns 0 without arming anything when it is set, which is
++ * indistinguishable from a real arm by return code alone (measured: register_kprobe+0x314).
++ * CONFIG_KALLSYMS_ALL makes this static bool resolvable at runtime; -1 means it is not (an older
++ * tree, or a build without KALLSYMS_ALL), so the caller reports "unknown" rather than "armed". */
++static inline int susfs_bti_kprobes_disarmed(void)
++{
++	bool *p = (bool *)ksu_kallsyms_lookup_name("kprobes_all_disarmed");
++
++	if (!p)
++		return -1;
++	return READ_ONCE(*p) ? 1 : 0;
++}
++
++/* After register_kprobe() returns success, confirm the instruction it claims to have replaced is
++ * the BRK kprobes installs.  arch_arm_kprobe() returns void and DISCARDS the text-write result, so
++ * a write the hypervisor refuses is a silent non-arm that register_kprobe() still reports as 0 -
++ * this read-back is the only way to tell from inside the module. */
++static inline int susfs_bti_verify_armed(struct kprobe *kp)
++{
++	unsigned int insn = SUSFS_BTI_WORD_READ_FAILED;
++
++	if (!kp->addr)
++		return -EINVAL;
++	if (copy_from_kernel_nofault(&insn, kp->addr, sizeof(insn))) {
++		pr_warn("susfs_bti: %s @%px: cannot read the armed site back - the arm cannot be confirmed\n",
++			kp->symbol_name ?: "?", (void *)kp->addr);
++		return -EFAULT;
++	}
++	if (insn != SUSFS_BTI_INSN_BRK) {
++		pr_warn("susfs_bti: %s @%px was NOT armed: read back %08x, expected %08x (offset=%u flags=%x) - the text write was refused or the probe was skipped\n",
++			kp->symbol_name ?: "?", (void *)kp->addr, insn, SUSFS_BTI_INSN_BRK,
++			kp->offset, kp->flags);
++		return -EIO;
++	}
++	SUSFS_LOGI("susfs_bti: %s @%px verified armed (read back %08x)\n",
++		   kp->symbol_name ?: "?", (void *)kp->addr, insn);
 +	return 0;
 +}
 +

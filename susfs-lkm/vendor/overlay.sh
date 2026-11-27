@@ -241,8 +241,10 @@ H=$tp/susfs_bti.h
 test -f "$H" || { echo "::error::kernel/susfs_bti.h did not land - the probe-point policy is missing"; exit 1; }
 for tok in \
   'susfs_bti_landing_pad' 'susfs_bti_pac_pad' 'susfs_bti_unsteppable' 'susfs_bti_guard' \
-  'susfs_bti_probe_point' 'susfs_bti_kretprobe_point' 'susfs_bti_arm_kprobe' \
+  'susfs_bti_probe_point' 'susfs_bti_probe_point_pad_entry' 'susfs_bti_kretprobe_point' \
+  'susfs_bti_arm_kprobe' 'susfs_bti_arm_kprobe_pad_entry' \
   'susfs_bti_arm_kretprobe' 'susfs_bti_refuse_kretprobe' 'susfs_bti_skip_caller' \
+  'susfs_bti_log_words' 'susfs_bti_kprobes_disarmed' 'susfs_bti_verify_armed' \
   'asm volatile(".inst 0xdac143e0"' 'kp->offset = (unsigned int)(probe - body);' \
   'kp->symbol_name'; do
 	grep -q "$tok" "$H" || {
@@ -264,7 +266,7 @@ test "$xpaci_files" -eq 2 || {
 }
 
 count_is() {	# file pattern expected label
-	n=$(grep -c "$2" "$tp/$1")
+	n=$(grep -c "$2" "$tp/$1" || true)
 	test "$n" -eq "$3" || {
 		echo "::error::$4 appears $n time(s) in $1, expected $3"
 		exit 1
@@ -279,9 +281,20 @@ count_is sus_mount.c 'susfs_bti_arm_kretprobe(&' 3 "susfs_bti_arm_kretprobe()"
 count_is sus_mount.c 'susfs_bti_refuse_kretprobe(' 2 "susfs_bti_refuse_kretprobe()"
 count_is sus_mount.c 'susfs_bti_skip_caller(regs)' 1 "susfs_bti_skip_caller(regs)"
 count_is susfs_avc_spoof.c 'susfs_bti_arm_kprobe(' 1 "susfs_bti_arm_kprobe()"
-count_is susfs_supercall.c 'susfs_bti_arm_kprobe(' 1 "susfs_bti_arm_kprobe()"
+# The reboot wrapper is reached through sys_call_table, so it takes the pad-entry form; a plain
+# arm there is the RWC 123 arming again, whatever the classifier answers.
+count_is susfs_supercall.c 'susfs_bti_arm_kprobe_pad_entry(' 1 "susfs_bti_arm_kprobe_pad_entry()"
+count_is susfs_supercall.c 'susfs_bti_arm_kprobe(' 0 "a non-pad arm helper in the supercall layer"
+count_is susfs_supercall.c 'susfs_bti_kprobes_disarmed(' 1 "the disarmed-switch read"
+count_is susfs_supercall.c 'susfs_bti_verify_armed(' 1 "the read-back verifier"
+count_is susfs_supercall.c 'susfs_bti_log_words(' 1 "the raw-word evidence on a failed read-back"
 count_is susfs_supercall.c 'susfs_bti_skip_caller(regs)' 1 "susfs_bti_skip_caller(regs)"
 count_is susfs_supercall.c 'probe=%px' 1 "the arming log's probe address"
+# The LSM slots are pointer-reached too (security_inode_permission+0x34 is `ldr x8,[x21,#0x18];
+# blr x8`), so the same three statements must be in the copied hook file.
+count_is lsm_hook.c 'susfs_bti_probe_point_pad_entry(' 1 "the pad-entry classifier in the LSM layer"
+count_is lsm_hook.c 'susfs_bti_verify_armed(' 1 "the LSM read-back verifier"
+count_is lsm_hook.c 'susfs_bti_strip_pac(' 1 "the deny path's PAC strip"
 count_is susfs_open_redirect.c 'susfs_bti_refuse_kretprobe(' 4 "susfs_bti_refuse_kretprobe()"
 count_is susfs_kstat.c 'susfs_bti_refuse_kretprobe(' 1 "susfs_bti_refuse_kretprobe()"
 count_is susfs_uname.c 'susfs_bti_refuse_kretprobe(' 1 "susfs_bti_refuse_kretprobe()"

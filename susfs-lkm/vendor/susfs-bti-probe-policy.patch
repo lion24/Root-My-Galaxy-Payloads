@@ -1088,7 +1088,7 @@
 +		return -EFAULT;
 +	}
 +	if (insn != SUSFS_BTI_INSN_BRK) {
-+		pr_warn("susfs_bti: %s @%px was NOT armed: read back %08x, expected %08x (offset=%u flags=%x) - the text write was refused or the probe was skipped\n",
++		pr_warn("susfs_bti: %s @%px was NOT armed: read back %08x, expected %08x (offset=%u flags=%lx) - the text write was refused or the probe was skipped\n",
 +			kp->symbol_name ?: "?", (void *)kp->addr, insn, SUSFS_BTI_INSN_BRK,
 +			kp->offset, kp->flags);
 +		return -EIO;

@@ -197,3 +197,116 @@ if grep -q 'regs->pc = regs->regs\[30\]' "$tp/susfs_hide_syms.c"; then
 	exit 1
 fi
 echo "hide_syms: probes armed after the BTI landing pad (RWC 121)"
+
+# RWC 123: the module's own probes were the BTI landmine, and the return probes cannot all be
+# moved.
+#
+# Two device panics (`Internal error: Oops - BTI`, pc/lr = invoke_syscall+0x58, thread
+# libksud.so) had the same single cause: reboot_kp sat on byte 0 of __arm64_sys_reboot, whose
+# paciasp IS the BTYPE=c landing pad invoke_syscall() needs for its
+# `ldr x20,[x2,w8,uxtw #3] ; blr x20`.  Every reboot(2) - the real one and the SUSFS supercall -
+# replaced that pad with BRK and took a BTI exception before any handler could run.  It is armed
+# once from the fatal layer, so it fired on the first boot that loaded the module.
+#
+# The general rule, and why it cannot be "move everything": a KPROBE may be moved past the
+# prologue prefix (landing pads, an early-exit guard and paciasp); with no frame yet, leaving
+# early is exactly "never called", and the resume strips the PAC paciasp left in LR (xpaci; the
+# strip is unconditional because over-stripping is the identity, under-stripping faults).  A
+# KRETPROBE may not: arch_prepare_kretprobe() substitutes &kretprobe_trampoline into x30, and the
+# function's own paciasp must sign that value for the epilogue's autiasp to authenticate it.  So
+# a return probe has exactly one safe offset - the paciasp - and only when a `bti` landing pad
+# precedes it (copy_mnt_ns is `bti c; cbz; paciasp`).  A function whose byte 0 IS paciasp has no
+# safe offset at all: byte 0 is both the pad and the signer.  That is refused for anything a
+# table or a resolved pointer can reach (sys_call_table, seq_operations/i_op slots,
+# single_open's show argument, this module's own pfn_d_path/or_vfs_statfs_fn), and kept only for
+# functions proven direct-call-only from the device's disassembly (attach_recursive_mnt and
+# do_statx: static/unexported, two or one `bl` call sites, no address materialised in the image).
+#
+# Every refusal is an honest, logged failure.  The refused disguises (statx stx_mnt_id, fdinfo
+# mnt_id, maps dev:ino, map_files readlink, uname, open_redirect's readlink/statfs) stay
+# un-disguised until a PAC-safe return hook exists - never armed "somewhere useful", which is
+# what the two panics cost.
+PATCH="$HERE/susfs-bti-probe-policy.patch"
+test -f "$PATCH" || { echo "::error::susfs-bti-probe-policy.patch is missing from the repository"; exit 1; }
+git -C "$SUSFS_SRC" apply --check "$PATCH" || {
+	echo "::error::susfs-bti-probe-policy.patch does not apply to this pin's kernel sources;"
+	echo "::error::RWC 123's fix would be silently absent. Rebase the patch on the new source."
+	exit 1
+}
+git -C "$SUSFS_SRC" apply "$PATCH"
+
+H=$tp/susfs_bti.h
+test -f "$H" || { echo "::error::kernel/susfs_bti.h did not land - the probe-point policy is missing"; exit 1; }
+for tok in \
+  'susfs_bti_landing_pad' 'susfs_bti_pac_pad' 'susfs_bti_unsteppable' 'susfs_bti_guard' \
+  'susfs_bti_probe_point' 'susfs_bti_kretprobe_point' 'susfs_bti_arm_kprobe' \
+  'susfs_bti_arm_kretprobe' 'susfs_bti_refuse_kretprobe' 'susfs_bti_skip_caller' \
+  'asm volatile(".inst 0xdac143e0"' 'kp->offset = (unsigned int)(probe - body);' \
+  'kp->symbol_name'; do
+	grep -q "$tok" "$H" || {
+		echo "::error::susfs_bti.h is missing '$tok' - the probe-point policy is incomplete"
+		exit 1
+	}
+	done
+if grep -q 'kp->symbol_name = NULL' "$H"; then
+	echo "::error::susfs_bti.h clears .symbol_name, but .symbol_name + .offset is the arming form"
+	exit 1
+fi
+
+# xpaci must exist in exactly two places: the device-proven hide_syms copy (RWC 121) and the
+# shared header (RWC 123).  A third hand-rolled copy is a path that will drift from the rule.
+xpaci_files=$(grep -rl 'asm volatile(".inst 0xdac143e0"' "$tp" | wc -l | tr -d ' ')
+test "$xpaci_files" -eq 2 || {
+	echo "::error::xpaci appears in $xpaci_files files, not the 2 that own it"
+	exit 1
+}
+
+count_is() {	# file pattern expected label
+	n=$(grep -c "$2" "$tp/$1")
+	test "$n" -eq "$3" || {
+		echo "::error::$4 appears $n time(s) in $1, expected $3"
+		exit 1
+	}
+}
+# Every probe goes through the classifier; the counts are the call sites the patch installs.
+count_is sus_map.c 'susfs_bti_arm_kprobe(' 1 "susfs_bti_arm_kprobe()"
+count_is sus_map.c 'susfs_bti_skip_caller(regs)' 3 "susfs_bti_skip_caller(regs)"
+count_is sus_map.c 'susfs_bti_refuse_kretprobe(' 1 "susfs_bti_refuse_kretprobe()"
+count_is sus_mount.c 'susfs_bti_arm_kprobe(' 2 "susfs_bti_arm_kprobe()"
+count_is sus_mount.c 'susfs_bti_arm_kretprobe(&' 3 "susfs_bti_arm_kretprobe()"
+count_is sus_mount.c 'susfs_bti_refuse_kretprobe(' 2 "susfs_bti_refuse_kretprobe()"
+count_is sus_mount.c 'susfs_bti_skip_caller(regs)' 1 "susfs_bti_skip_caller(regs)"
+count_is susfs_avc_spoof.c 'susfs_bti_arm_kprobe(' 1 "susfs_bti_arm_kprobe()"
+count_is susfs_supercall.c 'susfs_bti_arm_kprobe(' 1 "susfs_bti_arm_kprobe()"
+count_is susfs_supercall.c 'susfs_bti_skip_caller(regs)' 1 "susfs_bti_skip_caller(regs)"
+count_is susfs_supercall.c 'probe=%px' 1 "the arming log's probe address"
+count_is susfs_open_redirect.c 'susfs_bti_refuse_kretprobe(' 4 "susfs_bti_refuse_kretprobe()"
+count_is susfs_kstat.c 'susfs_bti_refuse_kretprobe(' 1 "susfs_bti_refuse_kretprobe()"
+count_is susfs_uname.c 'susfs_bti_refuse_kretprobe(' 1 "susfs_bti_refuse_kretprobe()"
+
+# The registrations those helpers replace must be gone: a re-added one bypasses every decision
+# above, and `register_kprobe(&kp_...)` alone would arm at byte 0 again.
+fatal=""
+for pat in \
+  '[^n]register_kretprobe(&kr_statx)' '[^n]register_kretprobe(&kr_map_files)' \
+  '[^n]register_kretprobe(&krp_kstat_map_vma)' '[^n]register_kretprobe(&kr_or_maps)' \
+  '[^n]register_kretprobe(&kr_or_dpath)' '[^n]register_kretprobe(&kr_or_vfs_statfs)' \
+  '[^n]register_kretprobe(&krp)' 'ksu_find_symbol_all("seq_show"' \
+  'susfs_bti_set_offset'; do
+	if grep -rq "$pat" "$tp"; then
+		echo "::error::a probe bypasses the BTI/PAC classifier ('$pat' is still present)"
+		fatal=1
+	fi
+done
+test -z "$fatal" || exit 1
+if grep -rq 'regs->pc = regs->regs\[30\]' "$tp"; then
+	echo "::error::a probe still resumes through raw x30 - the landing-pad fix is incomplete"
+	exit 1
+fi
+# ... and the refusals must be visible, not silent.
+refusals=$(grep -rl 'PAC-safe return hook' "$tp" | wc -l | tr -d ' ')
+test "$refusals" -eq 4 || {
+	echo "::error::the PAC-safe-return-hook refusal note is in $refusals files, expected 4"
+	exit 1
+}
+echo "probe policy: every probe classified, return probes that cannot move refused (RWC 123)"

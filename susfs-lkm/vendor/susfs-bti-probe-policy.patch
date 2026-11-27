@@ -1,0 +1,962 @@
+--- a/kernel/sus_map.c
++++ b/kernel/sus_map.c
+@@ -31,6 +31,7 @@
+ #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for the walk ops */
+ #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+ #include "susfs_kprobe.h"
++#include "susfs_bti.h"		/* RWC 121 class: the maps callbacks are op->show targets */
+ 
+ #define SUS_MAP_MAX 64
+ 
+@@ -158,7 +159,11 @@
+                             (unsigned long)inode->i_sb->s_dev,
+                             current_uid().val);
+         regs_set_return_value(regs, 0);
+-        regs->pc = regs->regs[30];
++        /* The probe sits after the landing-pad prefix, not on it: these callbacks are what
++         * proc_pid_maps_op/proc_pid_smaps_op hand seq_read_iter() through op->show, so byte 0
++         * is a BTI landing pad (see susfs_bti.h).  pc = x30 would therefore resume at a
++         * PAC-signed address; the helper strips it. */
++        susfs_bti_skip_caller(regs);
+         return 1;
+     }
+     return 0;
+@@ -342,7 +347,9 @@
+      * that from a skipped walk (upstream's own skip leaves the same value).  Leaving
+      * x0 = mm would turn pagemap_read()'s `ret` into a kernel pointer handed to read(2). */
+     regs_set_return_value(regs, 0);
+-    regs->pc = regs->regs[30];
++    /* The probe is armed past the landing pads and the PAC prologue (susfs_bti.h), so LR holds
++     * a signed value: xpaci turns it back into the return address. */
++    susfs_bti_skip_caller(regs);
+     return true;
+ }
+ 
+@@ -533,7 +540,7 @@
+ 
+     atomic_inc(&n_vm_hides);
+     regs_set_return_value(regs, 0);     /* "nothing transferred" */
+-    regs->pc = regs->regs[30];          /* skip the call: nothing is pinned */
++    susfs_bti_skip_caller(regs);        /* skip the call: nothing is pinned */
+     return 1;
+ }
+ 
+@@ -667,6 +674,17 @@
+ static bool map_registered;
+ static bool map_probe_armed[N_MAP_PROBES];
+ 
++/* Every one of these probes is armed past its landing pads, never at byte 0 (susfs_bti.h).
++ *
++ * Reachability decided the original set, but not this policy: show_map() and show_smap() are the
++ * .show members of proc_pid_maps_op/proc_pid_smaps_op (reached with `blr`, RWC 121), show_map_vma()
++ * is what those two call (and vendors repoint the tables freely - see the note above kp_map_outer),
++ * and get_user_pages_remote() is exported and starts `bti c; tbnz; tbnz; paciasp` - its byte 0 is
++ * a landing pad any module can reach through a pointer.  walk_page_range()/walk_page_vma()/
++ * __get_user_pages_remote() are direct-call today, but "direct-call today" is exactly the
++ * assumption RWC 121 and 123 invalidated, and moving the probe costs nothing: it fires at the same
++ * logical entry, only after the prologue prefix. */
++
+ /* Reachability, not configuration: "the probe is registered" says nothing on a kernel built
+  * with CONFIG_LTO_CLANG_FULL, where the call site it should catch may have been inlined away
+  * (walk_page_range() is EXPORT_SYMBOL_GPL and LTO may still inline the calls inside
+@@ -730,6 +748,17 @@
+         if ((map_probes[i] == &kp_map_walk || map_probes[i] == &kp_map_walk_vma) &&
+             !sus_map_walk_ops_any())
+             continue;
++        /* Classify the prologue first: arming at byte 0 is what RWC 121 did, and the first
++         * `cat /proc/<pid>/maps` after it is a BTI panic. */
++        rc = susfs_bti_arm_kprobe(map_probes[i]);
++        if (rc) {
++            pr_warn("sus_map: %s could not be armed after its landing pads (%d) - that listing is not filtered\n",
++                    map_probes[i]->symbol_name, rc);
++            susfs_kp_forget_addr(map_probes[i]);
++            if (!first_err)
++                first_err = rc;
++            continue;
++        }
+         rc = register_kprobe(map_probes[i]);
+         if (rc) {
+             pr_warn("sus_map: register_kprobe(%s) failed %d - that listing is not filtered\n",
+@@ -751,18 +780,18 @@
+         SUSFS_LOGI("sus_map: %d/%d probes armed (%d rules)\n",
+                 n, (int)N_MAP_PROBES, nmap);
+ 
+-    /* The map_files hook is a kretprobe, so it lives outside map_probes[] (which
+-     * holds struct kprobe *) and is tracked on its own; optional like the rest. */
++    /* The map_files hook is a kretprobe, so it lives outside map_probes[] (which holds struct
++     * kprobe *) and is tracked on its own; optional like the rest.  It is REFUSED rather than
++     * armed: map_files_get_link is the callback in /proc/<pid>/map_files/<range>'s inode
++     * operations, i.e. reached through i_op->get_link -> ei->op.proc_get_link with no direct call
++     * site - byte 0 is a BTI landing pad, and its paciasp makes a return probe at any later offset
++     * unusable (susfs_bti.h).  Consequence: readlink on the mapping still names the file, while
++     * the maps line itself is hidden - the narrower leak. */
+     if (!kr_map_files_ok) {
+-        int rc = register_kretprobe(&kr_map_files);
++        int rc = susfs_bti_refuse_kretprobe("map_files_get_link", "i_op->get_link");
+ 
+-        if (rc) {
+-            susfs_krp_forget_addr(&kr_map_files);
+-            pr_warn("sus_map: register_kretprobe(proc_map_files_get_link) failed %d - readlink on a hidden mapping still names the file\n",
+-                    rc);
+-        } else {
+-            kr_map_files_ok = true;
+-        }
++        if (rc)
++            pr_warn("sus_map: readlink on a hidden mapping still names the file until a PAC-safe return hook exists\n");
+     }
+ 
+     map_registered = map_probe_armed[0];   /* show_map_vma is the required one */
+--- a/kernel/sus_mount.c
++++ b/kernel/sus_mount.c
+@@ -148,6 +148,7 @@
+ #include "susfs.h"	/* module-wide declarations */
+ #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
+ #include "susfs_kprobe.h"
++#include "susfs_bti.h"		/* RWC 121 class: the show_* callbacks are op->show targets */
+ 
+ /* ---- the "which mounts are ours" prefix list: state ----
+  * Up here, not next to the control surface further down, because mount_stat() between
+@@ -1013,7 +1014,12 @@
+ }
+ 
+ /* copy_mnt_ns() is not static (fs/namespace.c:3424) and is on every namespace
+- * creation path (fork with CLONE_NEWNS, unshare, clone3). */
++ * creation path (fork with CLONE_NEWNS, unshare, clone3).  Its prologue is
++ * `bti c; cbz x1,<early return>; paciasp` (measured), so the return probe is armed
++ * on that paciasp: the landing pad at byte 0 survives, and the trampoline
++ * substitution arch_prepare_kretprobe() makes at the probe point is signed by the
++ * very instruction it sits on (see kernel/susfs_bti.h).  A probe at byte 0 would
++ * delete the pad - the RWC 121/123 shape. */
+ static struct kretprobe kr_clone_ns = {
+     .kp.symbol_name = "copy_mnt_ns",
+     .entry_handler = sus_mount_clone_entry,
+@@ -1268,36 +1274,21 @@
+ 
+ static int sus_mount_fdinfo_arm(void)
+ {
+-    unsigned long addrs[SUS_MOUNT_FDINFO_MAX];
+-    int i, n;
+-
+-    n = ksu_find_symbol_all("seq_show", addrs, SUS_MOUNT_FDINFO_MAX);
+-    if (n <= 0) {
+-        pr_warn("sus_mount: seq_show not resolved - fdinfo keeps printing the real mnt_id\n");
+-        return -ENOENT;
+-    }
+-    for (i = 0; i < n; i++) {
+-        struct kretprobe *kr = &kr_fdinfo[i];
+-        int rc;
+-
+-        kr->kp.addr = (void *)addrs[i];
+-        kr->entry_handler = sus_mount_fdinfo_entry;
+-        kr->handler = sus_mount_fdinfo_ret;
+-        kr->data_size = sizeof(struct sus_mount_kretprobe_state);
+-        kr->maxactive = 16;
+-        rc = register_kretprobe(kr);
+-        if (rc) {
+-            pr_warn("sus_mount: register_kretprobe(seq_show @%px) failed %d\n", (void *)addrs[i], rc);
+-            susfs_krp_forget_addr(kr);
+-            continue;
+-        }
+-        n_fdinfo_probes++;
+-    }
+-    if (!n_fdinfo_probes)
+-        return -EINVAL;
+-    SUSFS_LOGI("sus_mount: fdinfo hooked on %d/%d seq_show symbol(s)\n", n_fdinfo_probes, n);
+-    kr_fdinfo_ok = true;
+-    return 0;
++    /* Refused, and deliberately (RWC 123 taught this the hard way).
++     *
++     * fs/proc/fd.c registers this callback through single_open(file, seq_show, inode), so
++     * seq_read_iter() reaches it with `blr` and byte 0 is its BTYPE=c landing pad.  A kretprobe
++     * MUST sit at byte 0 - arch_prepare_kretprobe() substitutes &kretprobe_trampoline into x30,
++     * and only the function's own paciasp (single-stepped by kprobes) signs that value so the
++     * epilogue's autiasp can authenticate it.  Move the probe past the prologue and autiasp
++     * fails; leave it at byte 0 and the next fdinfo read takes a BTI exception.  There is no
++     * third offset: see the header comment in susfs_bti.h.
++     *
++     * Consequence: /proc/<pid>/fdinfo keeps printing the real mnt_id.  The mount LINES are still
++     * hidden by identity (the show_* probes above are moved, not refused), so only the id on an
++     * fd that points into a marked mount differs from the kernel's - a narrower oracle than the
++     * panic.  A PAC-safe return hook is the way to bring this back; see the handoff. */
++    return susfs_bti_refuse_kretprobe("seq_show", "single_open()'s op->show slot");
+ }
+ 
+ static void sus_mount_fdinfo_disarm(void)
+@@ -1532,7 +1523,12 @@
+         return 0;
+     sus_mount_note_id(r);
+     atomic_inc(&n_ident_hits);
+-    regs->pc = regs->regs[30];   /* skip this mount line */
++    /* Skip this mount line.  The probe is NOT at byte 0: all three show_* functions are the
++     * `.show` member of a seq_operations table, so seq_read_iter() reaches them with `blr`, and
++     * a probe on their paciasp landing pad would panic on the next read of /proc/mounts
++     * (exactly RWC 121's shape).  It is armed after that prefix instead, which is why the
++     * resume has to strip the PAC paciasp left in LR. */
++    susfs_bti_skip_caller(regs);
+     /* These show_* callbacks return int and x0 still holds seq_file*.
+      * seq_read() treats a negative return as a hard error, so a stray high
+      * bit here would break the whole read; upstream's equivalent site
+@@ -2623,14 +2619,27 @@
+      * armed is on mount_stat as `show_probes=<n>/3`, which makes a partial hide visible instead
+      * of silently smaller.  Only "none of the three" is fatal. */
+     for (i = 0; i < SUS_MOUNT_SHOW_N; i++) {
+-        rc = register_kprobe(sus_mount_show_probes[i]);
++        struct kprobe *kp = sus_mount_show_probes[i];
++
++        /* Resolve and RELOCATE before registering: the table holds the function body and
++         * seq_read_iter() reaches it with `blr`, so byte 0 is a BTI landing pad no probe may
++         * take (see susfs_bti.h).  Arming after the prologue prefix also means every resume
++         * goes through susfs_bti_skip_caller(), never raw x30. */
++        rc = susfs_bti_arm_kprobe(kp);
+         if (rc) {
++            pr_warn("sus_mount: %s could not be armed after its landing pad (%d) - that file keeps showing our mounts\n",
++                    sus_mount_show_names[i], rc);
++            susfs_kp_forget_addr(kp);
++            continue;
++        }
++        rc = register_kprobe(kp);
++        if (rc) {
+             pr_warn("sus_mount: register_kprobe(%s) failed %d - that file keeps showing our mounts\n",
+                     sus_mount_show_names[i], rc);
+             /* A failure after address resolution leaves .addr set, so the retry a later enable
+              * performs has to find the struct clear or it is refused with -EINVAL without
+              * ever reaching the symbol again - see susfs_kprobe.h. */
+-            susfs_kp_forget_addr(sus_mount_show_probes[i]);
++            susfs_kp_forget_addr(kp);
+             continue;
+         }
+         sus_mount_show_armed[i] = true;
+@@ -2648,17 +2657,24 @@
+     rc = sus_mount_fdinfo_arm();
+     if (rc)
+         pr_warn("sus_mount: the fdinfo probe could not be armed %d - /proc/<pid>/fdinfo keeps printing the real mnt_id\n", rc);
+-    rc = register_kretprobe(&kr_statx);
++    /* Refused: invoke_syscall() dispatches EL0 syscalls with `blr x20`, so this wrapper's byte 0
++     * is a BTI landing pad, and a return probe cannot be moved past its paciasp (susfs_bti.h).
++     * RWC 123 was exactly this shape on __arm64_sys_reboot - any statx(2), from any app, was a
++     * panic waiting to happen.  The second landing point below (do_statx) is direct-call-only, so
++     * the rewrite still has a chance to fire where the native wrapper delegates. */
++    rc = susfs_bti_refuse_kretprobe("__arm64_sys_statx", "sys_call_table (invoke_syscall's blr)");
++    if (rc)
++        pr_warn("sus_mount: statx keeps returning the real stx_mnt_id until a PAC-safe return hook exists\n");
++    /* do_statx() is a global function whose byte 0 is paciasp, so a return probe there leaves the
++     * entry without its landing pad.  That is safe only because nothing can reach it indirectly:
++     * it is not exported (fs/stat.c has no EXPORT_SYMBOL for it) and no address of it appears
++     * anywhere in this image - the syscall path reaches it with `bl`.  If that ever stops being
++     * true, susfs_bti_arm_kretprobe() refuses instead of arming. */
++    rc = susfs_bti_arm_kretprobe(&kr_statx_do, true,
++                                 "no EXPORT_SYMBOL and no address materialised in the image");
+     if (rc) {
+-        susfs_krp_forget_addr(&kr_statx);
+-        pr_warn("sus_mount: register_kretprobe(__arm64_sys_statx) failed %d - statx keeps returning the real stx_mnt_id\n", rc);
+-    } else {
+-        kr_statx_ok = true;
+-    }
+-    rc = register_kretprobe(&kr_statx_do);
+-    if (rc) {
+         susfs_krp_forget_addr(&kr_statx_do);
+-        pr_warn("sus_mount: register_kretprobe(do_statx) failed %d - the second statx landing point is not armed\n", rc);
++        pr_warn("sus_mount: do_statx could not be armed as a return probe (%d) - the second statx landing point is not armed\n", rc);
+     } else {
+         kr_statx_do_ok = true;
+     }
+@@ -2666,21 +2682,28 @@
+      * filesystem is unmounted, and the numbers the records are keyed by do get
+      * reused (measured).  A missing symbol means records can outlive their fs and
+      * falsely match another one, so say so instead of quietly degrading. */
+-    rc = register_kprobe(&kp_sb_down);
++    rc = susfs_bti_arm_kprobe(&kp_sb_down);
+     if (rc) {
+         susfs_kp_forget_addr(&kp_sb_down);
+-        pr_warn("sus_mount: register_kprobe(generic_shutdown_super) failed %d - records are NOT dropped when their filesystem is unmounted, a reused s_dev can match an unrelated mount\n",
++        pr_warn("sus_mount: generic_shutdown_super could not be armed past its landing pad (%d) - records are NOT dropped when their filesystem is unmounted, a reused s_dev can match an unrelated mount\n",
+                 rc);
+     } else {
+-        kp_sb_down_ok = true;
++        rc = register_kprobe(&kp_sb_down);
++        if (rc) {
++            susfs_kp_forget_addr(&kp_sb_down);
++            pr_warn("sus_mount: register_kprobe(generic_shutdown_super) failed %d - records are NOT dropped when their filesystem is unmounted, a reused s_dev can match an unrelated mount\n",
++                    rc);
++        } else {
++            kp_sb_down_ok = true;
++        }
+     }
+     /* Optional as well: without it a namespace copied after the enable keeps
+      * working for the mount TABLE (identity hides the lines) but fdinfo/statx stay
+      * inconsistent until somebody reads a mount table in that namespace. */
+-    rc = register_kretprobe(&kr_clone_ns);
++    rc = susfs_bti_arm_kretprobe(&kr_clone_ns, false, NULL);
+     if (rc) {
+         susfs_krp_forget_addr(&kr_clone_ns);
+-        pr_warn("sus_mount: register_kretprobe(copy_mnt_ns) failed %d - ids of mounts in a namespace copied later are only learned when its mount table is read\n",
++        pr_warn("sus_mount: copy_mnt_ns could not be armed as a return probe (%d) - ids of mounts in a namespace copied later are only learned when its mount table is read\n",
+                 rc);
+     } else {
+         kr_clone_ns_ok = true;
+@@ -2689,10 +2712,11 @@
+      * the module is already up (see the note above kr_newmnt).  Also optional in the
+      * sense that hiding keeps working for everything the scan saw - but without it a
+      * mount that appears later is not hidden anywhere, so a failure is reported. */
+-    rc = register_kretprobe(&kr_newmnt);
++    rc = susfs_bti_arm_kretprobe(&kr_newmnt, true,
++                                 "static in fs/namespace.c, two direct call sites, no address in the image");
+     if (rc) {
+         susfs_krp_forget_addr(&kr_newmnt);
+-        pr_warn("sus_mount: register_kretprobe(attach_recursive_mnt) failed %d - a mount created after the enable is NOT hidden (not marked, no identity recorded)\n",
++        pr_warn("sus_mount: attach_recursive_mnt could not be armed as a return probe (%d) - a mount created after the enable is NOT hidden (not marked, no identity recorded)\n",
+                 rc);
+     } else {
+         kr_newmnt_ok = true;
+--- a/kernel/susfs_kstat.c
++++ b/kernel/susfs_kstat.c
+@@ -57,6 +57,7 @@
+ #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+ #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
+ #include "susfs_kprobe.h"
++#include "susfs_bti.h"		/* show_map_vma is an op->show target: see RWC 121/123 */
+ 
+ /* KSTAT_SPOOF_* bits live in susfs_abi.h (upstream declares them in susfs.h next to struct
+  * st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are /proc-interface masks, not supercall ABI. */
+@@ -445,6 +446,11 @@
+  * so without this a write that is already inside the handler could arm the kretprobe again after
+  * the module started going away - its handler would then outlive the module. */
+ static bool kstat_maps_exiting;
++
++/* Set once by kstat_maps_arm().  The reason it refuses is a property of the kernel's entry
++ * (a BTI landing pad plus a PAC prologue), which no rule operation can change - so it is
++ * reported once and every later add/update/clear returns without logging it again. */
++static bool kstat_maps_refused;
+ 
+ static void kstat_maps_arm(void)
+ {
+@@ -455,26 +461,26 @@
+ 		mutex_unlock(&kstat_maps_ctl_lock);
+ 		return;
+ 	}
+-	if (kstat_maps_registered) {
++	if (kstat_maps_registered || kstat_maps_refused) {
+ 		mutex_unlock(&kstat_maps_ctl_lock);
+ 		return;
+ 	}
+-	rc = register_kretprobe(&krp_kstat_map_vma);
+-	if (rc) {
+-		/* Every later rule operation retries this arming (kstat_maps_arm() is called from
+-		 * the add/update/clear paths and from the supercall), so the struct has to come back
+-		 * clear: a failure that happened after the symbol was resolved leaves .addr set, and
+-		 * the retry would be refused with -EINVAL instead of trying again - see
+-		 * susfs_kprobe.h.  Safe under the lock. */
+-		susfs_krp_forget_addr(&krp_kstat_map_vma);
+-		mutex_unlock(&kstat_maps_ctl_lock);
+-		pr_warn("susfs_kstat: register_kretprobe(show_map_vma) failed %d - maps keeps printing the real dev:ino\n",
+-			rc);
+-	} else {
+-		kstat_maps_registered = true;
+-		mutex_unlock(&kstat_maps_ctl_lock);
+-		SUSFS_LOGI("susfs_kstat: maps hook armed (kretprobe show_map_vma)\n");
+-	}
++	/* Refused, not failed: show_map_vma() is reached through the maps seq_operations table
++	 * (op->show), so byte 0 is its BTI landing pad, and a return probe cannot be moved past
++	 * its paciasp - the trampoline substitution would go unsigned and autiasp would kill the
++	 * epilogue (susfs_bti.h).  This is the same shape as the maps kprobe in sus_map.c, which
++	 * is moved instead because a pre_handler needs no trampoline.
++	 *
++	 * Consequence: the maps listing keeps printing the real dev:ino for a spoofed inode.  The
++	 * rule still applies to stat/getattr (the tracepoint overlay in susfs_kp_stat.c), which is
++	 * what most checks read; only the maps column differs.  A PAC-safe return hook is the way
++	 * to bring this back. */
++	rc = susfs_bti_refuse_kretprobe("show_map_vma", "a maps seq_operations op->show slot");
++	kstat_maps_refused = true;
++	susfs_krp_forget_addr(&krp_kstat_map_vma);
++	mutex_unlock(&kstat_maps_ctl_lock);
++	if (rc)
++		pr_warn("susfs_kstat: maps keeps printing the real dev:ino until a PAC-safe return hook exists\n");
+ }
+ 
+ static void kstat_maps_disarm(void)
+--- a/kernel/susfs_open_redirect.c
++++ b/kernel/susfs_open_redirect.c
+@@ -60,6 +60,7 @@
+ #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+ #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
+ #include "susfs_kprobe.h"
++#include "susfs_bti.h"		/* RWC 121/123: which of the reverse hooks may be armed where */
+ #include "susfs_or_entry.h"	/* susfs_or_entry_armed(): the forward direction lives there now */
+ 
+ #define SUS_OR_MAX 64
+@@ -799,6 +800,9 @@
+ 
+ static struct kretprobe kr_or_fdinfo[OR_FDINFO_MAX];
+ static int n_or_fdinfo_probes;
++/* One-shot: the fdinfo kretprobe is refused (see or_register_reverse()), and that cannot change
++ * at run time, so the refusal is logged once rather than on every rule added. */
++static bool or_fdinfo_refused;
+ 
+ static bool or_registered;
+ static bool or_dpath_registered;
+@@ -838,70 +842,48 @@
+ 	if (or_exiting)
+ 		return;
+ 
++	/* d_path() and vfs_statfs() are refused for a reason peculiar to this module: it resolves
++	 * both and CALLS them through a pointer (pfn_d_path in sus_mount.c, or_vfs_statfs_fn below),
++	 * so an indirect branch into their byte 0 certainly exists - sus_mount's own hide path makes
++	 * it.  Both entries are paciasp at byte 0, and a return probe cannot be moved past the
++	 * instruction that must sign its trampoline substitution (susfs_bti.h), so arming at byte 0
++	 * would delete the landing pad and the next pfn_d_path()/or_vfs_statfs_fn() call would take
++	 * an "Oops - BTI".  That is the RWC 123 shape with our own module as the indirect caller.
++	 *
++	 * Consequence: readlink on a redirected file and statfs() on it keep naming the real target
++	 * while the forward redirect is live - two narrower oracles, never a panic.  A PAC-safe return
++	 * hook is the way to bring them back. */
+ 	if (!or_dpath_registered) {
+-		rc = register_kretprobe(&kr_or_dpath);
+-		if (rc) {
+-			susfs_krp_forget_addr(&kr_or_dpath);
+-			pr_warn("open_redirect: register_kretprobe(d_path) failed %d - readlink not disguised (or already inlined)\n",
+-				rc);
+-		} else {
+-			or_dpath_registered = true;
+-			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (d_path)\n");
+-		}
++		rc = susfs_bti_refuse_kretprobe("d_path", "this module's pfn_d_path (sus_mount.c)");
++		if (rc)
++			pr_warn("open_redirect: readlink keeps naming the real file until a PAC-safe return hook exists\n");
+ 	}
+ 
+ 	if (!or_statfs_registered) {
+-		rc = register_kretprobe(&kr_or_vfs_statfs);
+-		if (rc) {
+-			susfs_krp_forget_addr(&kr_or_vfs_statfs);
+-			pr_warn("open_redirect: register_kretprobe(vfs_statfs) failed %d - statfs not disguised (or already inlined)\n",
+-				rc);
+-		} else {
+-			or_statfs_registered = true;
+-			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (vfs_statfs)\n");
+-		}
++		rc = susfs_bti_refuse_kretprobe("vfs_statfs", "this module's or_vfs_statfs_fn");
++		if (rc)
++			pr_warn("open_redirect: statfs keeps naming the real file until a PAC-safe return hook exists\n");
+ 	}
+-	if (!or_maps_registered) {
+-		rc = register_kretprobe(&kr_or_maps);
+-		if (rc) {
+-			susfs_krp_forget_addr(&kr_or_maps);
+-			pr_warn("open_redirect: register_kretprobe(show_map_vma) failed %d - the maps dev:ino stays the redirected file's\n",
+-				rc);
+-		} else {
+-			or_maps_registered = true;
+-			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (show_map_vma)\n");
+-		}
+-	}
+-	if (!n_or_fdinfo_probes) {
+-		unsigned long addrs[OR_FDINFO_MAX];
+-		int i, n;
++	/* Refused: show_map_vma() is an maps seq_operations op->show target, so byte 0 is its BTI
++	 * landing pad and its paciasp rules out any later offset for a return probe (susfs_bti.h).
++	 * The maps column keeps naming the redirected file's dev:ino; the forward redirect is
++	 * unaffected. */
++	if (!or_maps_registered) {
++		int maps_rc = susfs_bti_refuse_kretprobe("show_map_vma", "a maps seq_operations op->show slot");
+ 
+-		/* Every symbol with this name - see kr_or_fdinfo[] for why one is not enough. */
+-		n = ksu_find_symbol_all("seq_show", addrs, OR_FDINFO_MAX);
+-		if (n <= 0)
+-			pr_warn("open_redirect: seq_show not resolved - fdinfo names the redirected inode\n");
+-		for (i = 0; i < n; i++) {
+-			struct kretprobe *kr = &kr_or_fdinfo[i];
++		if (maps_rc)
++			pr_warn("open_redirect: the maps dev:ino stays the redirected file's until a PAC-safe return hook exists\n");
++	}
++	/* Refused: fs/proc/fd.c installs this callback through single_open(file, seq_show, inode),
++	 * so seq_read_iter() reaches it with `blr` (byte 0 = BTI landing pad) while a kretprobe has
++	 * to sit at byte 0 for its own paciasp to sign the trampoline substitution.  No offset is
++	 * safe for both - see susfs_bti.h.  Reported once: the property cannot change at run time. */
++	if (!or_fdinfo_refused) {
++		int fd_rc = susfs_bti_refuse_kretprobe("seq_show", "single_open()'s op->show slot");
+ 
+-			kr->kp.addr = (void *)addrs[i];
+-			kr->entry_handler = or_fdinfo_entry;
+-			kr->handler = or_fdinfo_ret;
+-			kr->data_size = sizeof(struct seq_file *);
+-			kr->maxactive = 16;
+-			rc = register_kretprobe(kr);
+-			if (rc) {
+-				pr_warn("open_redirect: register_kretprobe(seq_show @%px) failed %d\n",
+-					(void *)addrs[i], rc);
+-				susfs_krp_forget_addr(kr);
+-				continue;
+-			}
+-			n_or_fdinfo_probes++;
+-		}
+-		if (n_or_fdinfo_probes)
+-			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (seq_show/fdinfo on %d/%d symbol(s))\n",
+-				   n_or_fdinfo_probes, n);
+-		else
+-			pr_warn("open_redirect: no seq_show kretprobe could be registered - fdinfo names the redirected inode\n");
++		or_fdinfo_refused = true;
++		if (fd_rc)
++			pr_warn("open_redirect: fdinfo names the redirected inode until a PAC-safe return hook exists\n");
+ 	}
+ }
+ 
+--- a/kernel/susfs_supercall.c
++++ b/kernel/susfs_supercall.c
+@@ -25,6 +25,8 @@
+ #include "susfs_abi.h"
+ #include "susfs_log.h"
+ #include "susfs.h"
++#include "susfs_bti.h"		/* RWC 123: the syscall entry is a BTI target reached by `blr` */
++#include "susfs_kprobe.h"	/* susfs_kp_forget_addr: a failed arming must not poison the retry */
+ 
+ struct susfs_tw {
+ 	struct callback_head cb;
+@@ -289,14 +291,20 @@
+ 	 * We cannot patch reboot.c, so mirror it from the kprobe: skip the rest of
+ 	 * __arm64_sys_reboot and return 0 - with these magic values reboot would otherwise
+ 	 * return -EINVAL, and the prebuilt ksu_susfs tool checks the syscall result.  The
+-	 * command itself still runs from task_work before we return to userspace. */
+-	regs->pc = regs->regs[30];
++	 * command itself still runs from task_work before we return to userspace.
++	 *
++	 * The probe is NOT at byte 0.  invoke_syscall() dispatches every EL0 syscall with
++	 * `ldr x20,[x2,w8,uxtw #3]; blr x20`, so this wrapper's first instruction is a BTYPE=c
++	 * landing pad, and a probe on it turns the next `reboot(2)` - ours or the real one -
++	 * into "Oops - BTI" (RWC 123).  It is armed after the prefix instead (see susfs_bti.h),
++	 * which is why the resume goes through the PAC strip: paciasp has already run here. */
++	susfs_bti_skip_caller(regs);
+ 	regs->regs[0] = 0;
+ 	return 1;
+ }
+ 
+ static struct kprobe reboot_kp = {
+-	.symbol_name = "__arm64_sys_reboot",
++	.symbol_name = "__arm64_sys_reboot",	/* the arm helper resolves it and adds the offset */
+ 	.pre_handler = reboot_pre,
+ };
+ 
+@@ -357,13 +365,21 @@
+ 	/* One-shot: armed here and dropped in susfs_supercall_exit() only, so no retry can ever meet a
+ 	 * stale .addr.  This layer is fatal, so a failure refuses the load instead of leaving the probe
+ 	 * half-armed - which is why it is exempt from the reset rule in kernel/susfs_kprobe.h. */
++	rc = susfs_bti_arm_kprobe(&reboot_kp);
++	if (rc) {
++		pr_warn("susfs supercall: __arm64_sys_reboot is not probeable after its landing pad (%d) - refusing to arm the supercall ABI\n",
++			rc);
++		return rc;
++	}
+ 	rc = register_kprobe(&reboot_kp);
+ 	if (rc) {
++		susfs_kp_forget_addr(&reboot_kp);
+ 		pr_warn("susfs supercall: register_kprobe(reboot) failed %d\n", rc);
+ 		return rc;
+ 	}
+ 	sc_registered = true;
+-	SUSFS_LOGI("susfs supercall: armed (reboot ABI, version " SUSFS_VERSION_STR ")\n");
++	SUSFS_LOGI("susfs supercall: armed (reboot ABI, version " SUSFS_VERSION_STR ", probe=%px)\n",
++		   (void *)reboot_kp.addr);
+ 	return 0;
+ }
+ 
+--- a/kernel/susfs_uname.c
++++ b/kernel/susfs_uname.c
+@@ -18,6 +18,7 @@
+ #include "susfs_log.h"
+ #include "susfs.h"	/* susfs_abi_path_ok */
+ #include "susfs_kprobe.h"
++#include "susfs_bti.h"	/* RWC 123: the syscall entry is a BTI target reached by `blr` */
+ 
+ #define SUSFS_UNAME_LEN (__NEW_UTS_LEN + 1)
+ 
+@@ -95,20 +96,14 @@
+         mutex_unlock(&uname_ctl_lock);
+         return 0;
+     }
+-    rc = register_kretprobe(&krp);
+-    if (rc) {
+-        /* CMD_SUSFS_SET_UNAME can be sent again after a failure, and the address the kernel
+-         * resolved is already in the struct: without this the retry is refused with -EINVAL
+-         * and the spoof can never be turned on - see susfs_kprobe.h.  Safe under the lock. */
+-        susfs_krp_forget_addr(&krp);
+-        mutex_unlock(&uname_ctl_lock);
+-        return rc;
+-    }
+-    uname_registered = true;
++    /* Refused: newuname is a sys_call_table entry, so invoke_syscall() reaches the wrapper with
++     * `blr` - byte 0 is its BTYPE=c landing pad - and a return probe cannot be moved past the
++     * wrapper's paciasp without breaking its autiasp (susfs_bti.h).  RWC 123 was this exact
++     * arrangement on __arm64_sys_reboot: the first reboot(2) from any process panicked the
++     * phone.  The spoof stays off and the caller gets a real error, not a silent success. */
++    rc = susfs_bti_refuse_kretprobe("__arm64_sys_newuname", "sys_call_table (invoke_syscall's blr)");
+     mutex_unlock(&uname_ctl_lock);
+-    SUSFS_LOGI("uname spoof armed: release=%s version=%s\n",
+-            fake_release, fake_version);
+-    return 0;
++    return rc;
+ }
+ 
+ static void uname_unregister(void)
+--- a/kernel/susfs_avc_spoof.c
++++ b/kernel/susfs_avc_spoof.c
+@@ -20,6 +20,7 @@
+ #include "susfs_log.h"
+ #include "susfs.h"	/* susfs_expose_proc */
+ #include "susfs_kprobe.h"
++#include "susfs_bti.h"		/* arm past slow_avc_audit's landing pads (RWC 121 class) */
+ #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
+ 
+ /* module_param overrides for the two domains: the default su domain is the SukiSU variant ("ksu"), stock
+@@ -107,6 +108,16 @@
+ 		mutex_unlock(&avc_ctl_lock);
+ 		return 0;
+ 	}
++	/* slow_avc_audit() begins paciasp (measured), i.e. its byte 0 is a BTI landing pad that any
++	 * indirect caller needs; arm after it (a pre_handler needs no trampoline, so this is the
++	 * RWC 121 fix shape, see susfs_bti.h).  Its arguments are untouched by the prologue, so the
++	 * handler still reads tsid from the same register. */
++	rc = susfs_bti_arm_kprobe(&kp_avc);
++	if (rc) {
++		susfs_kp_forget_addr(&kp_avc);
++		mutex_unlock(&avc_ctl_lock);
++		return rc;
++	}
+ 	rc = register_kprobe(&kp_avc);
+ 	if (rc) {
+ 		/* The failure that matters is reported to the caller, but the address the kernel
+--- /dev/null
++++ b/kernel/susfs_bti.h
+@@ -0,0 +1,334 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * susfs_bti.h - where a probe may sit on this kernel's functions.
++ *
++ * Two different things make a probe fatal here, both measured on the device (RWC 121, RWC 123):
++ *
++ * 1. BTI.  CONFIG_ARM64_BTI_KERNEL is on, so every INDIRECT branch (`blr`) checks that the target
++ *    starts with a landing pad: `bti c`/`bti jc`, or `paciasp`/`pacibsp`.  kprobe replaces the
++ *    probed instruction with BRK, so a probe at byte 0 of such a target deletes the landing pad
++ *    and the next indirect call takes an "Oops - BTI" and panics.  Direct branches are NOT
++ *    checked, which is why a probe at byte 0 is still right for a function nothing calls through
++ *    a pointer.  RWC 121 was `seq_read_iter`'s `ldr x8,[op,#0x18]; blr x8` reaching m_show/s_show;
++ *    RWC 123 was `invoke_syscall`'s `ldr x20,[x2,w8,uxtw #3]; blr x20` reaching __arm64_sys_reboot.
++ *
++ *    Byte 0 is not the only instruction that can be a landing pad in practice: this kernel has
++ *    functions that begin `bti c; cbz/tbnz <early exit>; paciasp` (copy_mnt_ns and
++ *    get_user_pages_remote, both measured).  A probe on the `bti c` deletes the pad; a probe on
++ *    the guard is refused by arm64 kprobes itself (a branch is not steppable); the only sound
++ *    landing point is after the pads and past the guard.
++ *
++ * 2. PAC.  Every non-leaf function signs LR on entry (`paciasp`) and authenticates it in the
++ *    epilogue (`autiasp`, against SP).  So:
++ *
++ *      - a KPROBE may be MOVED past the prologue prefix.  Landing pads, an early-exit guard and
++ *        the PAC instruction are skipped, so no frame exists yet and leaving the function early
++ *        is exactly "it was never called".  But paciasp has already run, so LR holds a signed
++ *        value: the resume path must strip it (xpaci) before jumping to it.
++ *
++ *      - a KRETPROBE is trickier.  arch_prepare_kretprobe() saves regs->regs[30] as the return
++ *        address and writes &kretprobe_trampoline into x30; the callee's own paciasp must sign
++ *        that substituted value for the epilogue's autiasp to authenticate it.  So the probe
++ *        has to sit BEFORE the PAC instruction (or on it - kprobes single-steps it), and the
++ *        landing pad at byte 0 must survive.  That leaves exactly one safe shape:
++ *
++ *              bti c [; early-exit guard] ; paciasp ...     -> arm on the paciasp
++ *
++ *        A function whose byte 0 IS paciasp has no such offset: byte 0 is both the landing pad
++ *        and the signer.  That is fine for a function no indirect branch can reach (a static
++ *        function with no address taken, proven from this kernel's disassembly and used to
++ *        justify every `direct_only` argument below), and it must be REFUSED for anything a
++ *        table or a resolved pointer can reach - susfs_bti_refuse_kretprobe() names the reaching
++ *        site in the log.  Arming it "somewhere useful" is what RWC 121/123 cost two boots each.
++ *
++ * The rule this header implements:
++ *
++ *      kprobe    on any target -> arm past the landing pads/PAC prefix, strip PAC on resume
++ *      kretprobe on `bti`-prefixed entry -> arm on the paciasp (pad intact, substitution signed)
++ *      kretprobe on a paciasp-at-0 entry -> arm at byte 0 only when it is direct-call only
++ *      kretprobe on a table/pointer-reached entry -> refuse; there is no safe offset
++ *
++ * "Indirect target" is not derivable from the function itself: paciasp IS a landing pad, and most
++ * functions start with it whether or not anything calls them through a pointer.  Which functions
++ * are indirect targets was decided per call site from this kernel's disassembly (sys_call_table,
++ * seq_operations, inode/seq operation tables, and the symbols this module resolves and calls
++ * through a pointer itself), and every refusal names the table that reaches it.
++ *
++ * The resume helper strips PAC UNCONDITIONALLY.  Over-stripping is safe - xpaci is the identity on
++ * a canonical kernel address that was never signed (CONFIG_ARM64_PTR_AUTH off makes paciasp a
++ * hint) and on a signed one it is exactly the strip - while under-stripping resumes at a signed
++ * pointer and faults.  The pac flag is therefore only reported in the log, never acted on.
++ */
++#ifndef __SUSFS_BTI_H
++#define __SUSFS_BTI_H
++
++#include <linux/kprobes.h>
++#include <linux/types.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>	/* copy_from_kernel_nofault() */
++#include "susfs_log.h"		/* SUSFS_LOGI: the arm/refuse lines are evidence, not noise */
++#include "symbol_resolver.h"	/* ksu_kallsyms_lookup_name() */
++
++/* The prologue instructions this kernel uses as landing pads / PAC signers. */
++#define SUSFS_BTI_INSN_BTI	0xd503241f
++#define SUSFS_BTI_INSN_BTI_C	0xd503245f
++#define SUSFS_BTI_INSN_BTI_J	0xd503249f
++#define SUSFS_BTI_INSN_BTI_JC	0xd50324df
++#define SUSFS_BTI_INSN_PACIASP	0xd503233f
++#define SUSFS_BTI_INSN_PACIBSP	0xd503237f
++
++/* bti (any form): a landing pad that no instruction-signing needs. */
++static inline bool susfs_bti_landing_pad(unsigned int insn)
++{
++	switch (insn) {
++	case SUSFS_BTI_INSN_BTI:
++	case SUSFS_BTI_INSN_BTI_C:
++	case SUSFS_BTI_INSN_BTI_J:
++	case SUSFS_BTI_INSN_BTI_JC:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* paciasp/pacibsp: a landing pad AND the instruction that signs LR. */
++static inline bool susfs_bti_pac_pad(unsigned int insn)
++{
++	return insn == SUSFS_BTI_INSN_PACIASP || insn == SUSFS_BTI_INSN_PACIBSP;
++}
++
++/* An instruction arm64 kprobes will not single-step: its effect depends on the address it runs
++ * from, so the copy kprobes executes would do the wrong thing (decode-insn.c:
++ * aarch64_insn_is_steppable()).  The match does not have to be exact: the scanner uses it only to
++ * avoid CHOOSING such an instruction as the probe point, and one it misses is still rejected by
++ * arch_prepare_kprobe() (-EINVAL), which the callers report and do not treat as armed. */
++static inline bool susfs_bti_unsteppable(unsigned int insn)
++{
++	if ((insn & 0xfc000000) == 0x14000000)	/* b */
++		return true;
++	if ((insn & 0xfc000000) == 0x94000000)	/* bl: also clobbers x30 */
++		return true;
++	if ((insn & 0xff000000) == 0x54000000)	/* b.cond */
++		return true;
++	if ((insn & 0x7e000000) == 0x34000000)	/* cbz / cbnz */
++		return true;
++	if ((insn & 0x7e000000) == 0x36000000)	/* tbz / tbnz */
++		return true;
++	if ((insn & 0xfe000000) == 0xd6000000)	/* br / blr / ret / eret */
++		return true;
++	return false;
++}
++
++/* A conditional branch: the prologue shape `bti c; cbz/tbnz <return early>; paciasp` uses one
++ * before the PAC instruction, and it is a guard whose taken path builds no frame. */
++static inline bool susfs_bti_guard(unsigned int insn)
++{
++	if ((insn & 0xff000000) == 0x54000000)	/* b.cond */
++		return true;
++	if ((insn & 0x7e000000) == 0x34000000)	/* cbz / cbnz */
++		return true;
++	if ((insn & 0x7e000000) == 0x36000000)	/* tbz / tbnz */
++		return true;
++	return false;
++}
++
++/* XPACI x0: the strip needs no key and no authentication - it is what turns the value paciasp
++ * left in LR back into the return address.  Identity on an address that was never signed. */
++static inline unsigned long susfs_bti_strip_pac(unsigned long addr)
++{
++	register unsigned long val asm("x0") = addr;
++
++	asm volatile(".inst 0xdac143e0" : "+r" (val));	/* xpaci x0 */
++	return val;
++}
++
++/* Leave the probed function as if it had been called and returned 0: at the probe point no frame
++ * exists yet, so only PC (and, for the show_* callbacks, x0) may change. */
++static inline void susfs_bti_skip_caller(struct pt_regs *regs)
++{
++	regs->pc = susfs_bti_strip_pac(regs->regs[30]);
++}
++
++/* KPROBE point: the first instruction after the landing pads, an early-exit guard and the PAC
++ * instruction.  Skipping past paciasp is mandatory - a probe ON it would still delete the landing
++ * pad - and the caller already starts from a fresh `.offset`, so this runs on every arm. */
++static inline int susfs_bti_probe_point(unsigned long body, unsigned long *probe, bool *pac_lr)
++{
++	unsigned int insn;
++	unsigned long pc = body;
++	bool signed_lr = false;
++	int i;
++
++	for (i = 0; i < 8; i++) {
++		if (copy_from_kernel_nofault(&insn, (void *)pc, sizeof(insn)))
++			return -EFAULT;
++		if (susfs_bti_landing_pad(insn)) {
++			pc += sizeof(insn);
++			continue;
++		}
++		if (susfs_bti_pac_pad(insn)) {
++			signed_lr = true;
++			pc += sizeof(insn);
++			continue;
++		}
++		/* Only BETWEEN byte 0 and the PAC instruction, and only a conditional guard: at
++		 * byte 0 a branch means the entry is a thunk, and without a PAC instruction after
++		 * it there is nothing left to skip. */
++		if (i > 0 && !signed_lr && susfs_bti_guard(insn)) {
++			pc += sizeof(insn);
++			continue;
++		}
++		break;
++	}
++	if (i == 8)
++		return -EINVAL;		/* eight pads/guards and no body: not a function entry */
++	if (susfs_bti_unsteppable(insn))
++		return -EOPNOTSUPP;	/* no point found that kprobes can single-step */
++
++	*probe = pc;
++	*pac_lr = signed_lr;
++	return 0;
++}
++
++/* KRETPROBE point.  @probe_on_pac says the point is the paciasp itself (so the trampoline
++ * substitution happens before signing); @entry_is_pad says the probe is at byte 0 AND byte 0 is
++ * the landing pad, i.e. arming here breaks BTI for any indirect caller - the caller decides,
++ * because only it knows whether the function can be reached through a pointer. */
++static inline int susfs_bti_kretprobe_point(unsigned long body, unsigned long *probe,
++					    bool *probe_on_pac, bool *entry_is_pad)
++{
++	unsigned int insn;
++	unsigned long pc = body;
++	bool saw_pad = false;
++	int i;
++
++	*probe_on_pac = false;
++	*entry_is_pad = false;
++
++	for (i = 0; i < 8; i++) {
++		if (copy_from_kernel_nofault(&insn, (void *)pc, sizeof(insn)))
++			return -EFAULT;
++		if (susfs_bti_landing_pad(insn)) {
++			saw_pad = true;
++			pc += sizeof(insn);
++			continue;
++		}
++		if (susfs_bti_pac_pad(insn)) {
++			*probe = pc;
++			*probe_on_pac = true;
++			*entry_is_pad = (pc == body);
++			return 0;
++		}
++		if (!saw_pad)
++			break;		/* byte 0, and it is not a landing pad */
++		if (susfs_bti_guard(insn)) {
++			pc += sizeof(insn);
++			continue;
++		}
++		break;			/* a pad, then a body with no PAC instruction */
++	}
++	if (i == 8)
++		return -EINVAL;
++	if (susfs_bti_unsteppable(insn))
++		return -EOPNOTSUPP;
++
++	*probe = pc;
++	*probe_on_pac = false;
++	*entry_is_pad = false;
++	return 0;
++}
++
++/* Resolve the probe's symbol and set .offset so it lands past the prologue prefix.  .symbol_name
++ * is deliberately KEPT: kprobes allows .symbol_name + .offset (it refuses both .addr and
++ * .symbol_name), the offset is added exactly once by _kprobe_addr(), and the handlers print
++ * kp->symbol_name in their log lines.  .addr must be NULL on entry and after every failure - see
++ * susfs_kprobe.h for why a retry inherits it otherwise. */
++static inline int susfs_bti_arm_kprobe(struct kprobe *kp)
++{
++	unsigned long body, probe;
++	bool pac_lr = false;
++	int rc;
++
++	if (!kp->symbol_name) {
++		pr_warn("susfs_bti: a kprobe with no symbol name cannot be classified - not armed\n");
++		return -EINVAL;
++	}
++	kp->addr = NULL;
++
++	body = ksu_kallsyms_lookup_name(kp->symbol_name);
++	if (!body) {
++		pr_warn("susfs_bti: %s is not in kallsyms - nothing to arm\n", kp->symbol_name);
++		return -ENOENT;
++	}
++
++	rc = susfs_bti_probe_point(body, &probe, &pac_lr);
++	if (rc) {
++		pr_warn("susfs_bti: %s+0 (%px) has no point kprobes may take after its landing pads (%d) - not armed\n",
++			kp->symbol_name, (void *)body, rc);
++		return rc;
++	}
++
++	kp->offset = (unsigned int)(probe - body);
++	SUSFS_LOGI("susfs_bti: %s body=%px probe=%px (+%u%s)\n",
++		   kp->symbol_name, (void *)body, (void *)probe, kp->offset,
++		   pac_lr ? ", past its PAC prologue - the resume strips it" : ", no landing pad was skipped");
++	return 0;
++}
++
++/* Resolve @kr's symbol and arm it at the only offset a return probe has: the instruction that
++ * signs the trampoline substitution.  @direct_only is the caller's proof that no indirect branch
++ * can reach this function's byte 0 (a static function with no address taken, checked against the
++ * device's disassembly); without it, a paciasp-at-0 entry is refused rather than armed. */
++static inline int susfs_bti_arm_kretprobe(struct kretprobe *kr, bool direct_only,
++					  const char *direct_only_why)
++{
++	unsigned long body, probe;
++	bool on_pac = false, entry_pad = false;
++	int rc;
++
++	if (!kr->kp.symbol_name) {
++		pr_warn("susfs_bti: a kretprobe with no symbol name cannot be classified - not armed\n");
++		return -EINVAL;
++	}
++	kr->kp.addr = NULL;
++
++	body = ksu_kallsyms_lookup_name(kr->kp.symbol_name);
++	if (!body) {
++		pr_warn("susfs_bti: %s is not in kallsyms - nothing to arm\n", kr->kp.symbol_name);
++		return -ENOENT;
++	}
++
++	rc = susfs_bti_kretprobe_point(body, &probe, &on_pac, &entry_pad);
++	if (rc) {
++		pr_warn("susfs_bti: %s+0 (%px) has no point a return probe may take (%d) - not armed\n",
++			kr->kp.symbol_name, (void *)body, rc);
++		return rc;
++	}
++
++	if (entry_pad && !direct_only) {
++		pr_warn("susfs_bti: refusing kretprobe(%s): its entry IS its BTI landing pad (paciasp at byte 0), and a return probe cannot be moved past the instruction that must sign its trampoline - that feature stays off (reached through %s) - see the header comment\n",
++			kr->kp.symbol_name, direct_only_why ? direct_only_why : "a table or a resolved pointer");
++		return -EOPNOTSUPP;
++	}
++
++	kr->kp.offset = (unsigned int)(probe - body);
++	SUSFS_LOGI("susfs_bti: kretprobe %s body=%px probe=%px (+%u, %s)\n",
++		   kr->kp.symbol_name, (void *)body, (void *)probe, kr->kp.offset,
++		   entry_pad ? "byte 0 is paciasp, and this function is direct-call only: no indirect branch can reach its landing pad"
++			     : on_pac ? "armed on the PAC instruction after its bti landing pad: the pad stays and the substitution is signed"
++				      : "armed after its landing pads; the entry has no PAC instruction");
++	return 0;
++}
++
++/* Refuse an entry kretprobe on a function that is reached through a pointer.  @reached_through
++ * names the site (sys_call_table, an op->show/op->get_link slot, single_open's show argument,
++ * this module's own resolved function pointer), because the reasoning is site-specific - see the
++ * header comment for why neither offset 0 nor a later one can work for a return probe there. */
++static inline int susfs_bti_refuse_kretprobe(const char *symbol, const char *reached_through)
++{
++	pr_warn("susfs_bti: refusing kretprobe(%s): %s reaches it through a pointer, so byte 0 is its BTI landing pad and its PAC prologue makes any later offset unusable for a return probe - that feature stays off\n",
++		symbol, reached_through);
++	return -EOPNOTSUPP;
++}
++
++#endif /* __SUSFS_BTI_H */

@@ -465,13 +465,25 @@ jobs:
           python3 tools/check_kernel_version.py --log /tmp/kbuild.log --tree KernelSU \
             --flavor "${{ env.FLAVOR }}"
 
+      # The generic daemon embeds every KMI as `<kmi>_kernelsu.ko`, and a flat
+      # artifact download keeps distinct file names but loses per-artifact
+      # folders (download-artifact@v7 flattened a pattern download into
+      # path/kernelsu.ko, run 46156578820), so the artifact carries the file
+      # under its interface name and keeps its folder structure for consumers
+      # that read <artifact>/kernel/kernelsu.ko.
+      - name: Copy the module under its KMI interface name
+        run: |
+          mkdir -p userspace/ksud/bin/aarch64
+          cp KernelSU/kernel/kernelsu.ko userspace/ksud/bin/aarch64/${{ matrix.kmi }}_kernelsu.ko
+
       - name: Upload kernelsu.ko
         uses: actions/upload-artifact@v7
         with:
           name: kernelsu-${{ env.KSU_REF }}-${{ matrix.kmi }}-${{ matrix.no_patch_text && 'no-patch-text' || 'patch-text' }}
-          path: KernelSU/kernel/kernelsu.ko
+          path: |
+            KernelSU/kernel/kernelsu.ko
+            userspace/ksud/bin/aarch64/${{ matrix.kmi }}_kernelsu.ko
           if-no-files-found: error
-
   # ---------------------------------------------------------------------------------------------
   # The image the pair builds in, before anything is pulled into it.
   #
@@ -1047,8 +1059,12 @@ jobs:
           echo "the daemon will carry: $kmis"
           mkdir -p KernelSU/userspace/ksud/bin/aarch64
           for kmi in $kmis; do
-            src="/tmp/generic/kernelsu-${{ env.KSU_REF }}-${kmi}-no-patch-text/kernelsu.ko"
-            if [ ! -s "$src" ]; then
+            # The download may keep per-artifact folders or flatten the whole
+            # pattern into /tmp/generic (download-artifact@v7 did both shapes
+            # across versions), and the module upload carries the KMI-named
+            # copy precisely so the name survives any of them.
+            src=$(find /tmp/generic -type f -name "${kmi}_kernelsu.ko" -size +1k | head -1)
+            if [ -z "$src" ]; then
               echo "::error::the module job built no no-patch-text module for $kmi"
               ls -1 /tmp/generic || true
               exit 1

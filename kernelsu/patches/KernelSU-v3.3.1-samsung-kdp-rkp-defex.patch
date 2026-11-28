@@ -884,6 +884,129 @@ index c344bd55..cd631aef 100644
  }
  
  /*
+diff --git a/kernel/supercall/supercall.c b/kernel/supercall/supercall.c
+index 6db264956589..62bb260d35c3 100644
+--- a/kernel/supercall/supercall.c
++++ b/kernel/supercall/supercall.c
+@@ -16,6 +16,7 @@
+ #include "arch.h"
+ #include "util.h"
+ #include "klog.h" // IWYU pragma: keep
++#include "infra/symbol_resolver.h"
+ 
+ #define KSU_DRIVER_PERMISSION_SU_SESSION (1UL << 0)
+ 
+@@ -144,12 +145,110 @@ static struct kprobe reboot_kp = {
+     .pre_handler = reboot_handler_pre,
+ };
+ 
++/* The prologue words this kernel's function entries use as landing pads / PAC
++ * signers, and the BRK #4 arm64 kprobes writes over the probed instruction. */
++#define KSU_INSN_BTI		0xd503241f
++#define KSU_INSN_BTI_C		0xd503245f
++#define KSU_INSN_BTI_J		0xd503249f
++#define KSU_INSN_BTI_JC		0xd50324df
++#define KSU_INSN_PACIASP	0xd503233f
++#define KSU_INSN_PACIBSP	0xd503237f
++#define KSU_INSN_BRK_KPROBE	0xd4200080
++
++static bool ksu_landing_pad(unsigned int insn)
++{
++    switch (insn) {
++    case KSU_INSN_BTI:
++    case KSU_INSN_BTI_C:
++    case KSU_INSN_BTI_J:
++    case KSU_INSN_BTI_JC:
++    case KSU_INSN_PACIASP:
++    case KSU_INSN_PACIBSP:
++        return true;
++    default:
++        return false;
++    }
++}
++
++/*
++ * RWC 123: __arm64_sys_reboot is a sys_call_table entry, so invoke_syscall
++ * reaches its byte 0 with `blr x20`, and arm64 BTI checks what that byte holds.
++ * A probe registered at byte 0 replaces the wrapper's landing pad with BRK #4,
++ * so the next reboot(2) panics instead of reaching reboot_handler_pre -
++ * measured on S916BXXUAGZIF, where this wrapper's byte 0 is paciasp
++ * (d503233f) and the byte-0 probe cost the boot.  So the probe is parked past
++ * the pads: the first word after a pad READ at byte 0 is where no frame exists
++ * yet, and x0 (the real pt_regs pointer reboot_handler_pre dereferences
++ * through PT_REAL_REGS) is untouched.  A byte 0 that cannot be read, or one
++ * that already holds BRK #4 (another kprobe owns the wrapper), is refused: the
++ * install-fd supercall stays off for this boot rather than colliding with the
++ * other owner or guessing.  A byte 0 that is not a pad at all (a kernel without
++ * BTI enforcement) keeps the upstream probe point.  .symbol_name is kept, so
++ * kprobes adds .offset exactly once and the handler log keeps printing the
++ * wrapper's name.
++ */
++static int ksu_reboot_probe_park(void)
++{
++    unsigned long body = find_kernel_symbol_exact(REBOOT_SYMBOL);
++    unsigned long pc = body;
++    unsigned int insn = 0, first = 0;
++    bool saw_pad = false;
++    int i;
++
++    if (!body) {
++        pr_err("reboot kprobe: %s is not in kallsyms - not armed\n", REBOOT_SYMBOL);
++        return -ENOENT;
++    }
++
++    for (i = 0; i < 8; i++) {
++        if (copy_from_kernel_nofault(&insn, (void *)pc, sizeof(insn))) {
++            pr_err("reboot kprobe: cannot read the wrapper at %px - not armed\n",
++                   (void *)pc);
++            return -EFAULT;
++        }
++        if (i == 0)
++            first = insn;
++        if (ksu_landing_pad(insn)) {
++            saw_pad = true;
++            pc += sizeof(insn);
++            continue;
++        }
++        break;
++    }
++    if (i == 8) {
++        pr_err("reboot kprobe: %px is all pads, not a function entry - not armed\n",
++               (void *)body);
++        return -EINVAL;
++    }
++    reboot_kp.offset = (unsigned int)(pc - body);
++    if (!saw_pad) {
++        if (first == KSU_INSN_BRK_KPROBE) {
++            pr_err("reboot kprobe: byte 0 of %px reads BRK #4 - a foreign kprobe owns the wrapper; not armed, the install-fd supercall stays off this boot\n",
++                   (void *)body);
++            return -EEXIST;
++        }
++        pr_warn("reboot kprobe: no landing pad at byte 0 of %px (%08x); arming there as before\n",
++                (void *)body, first);
++        return 0;
++    }
++    pr_info("reboot kprobe: parked +%u past the pads at %px; byte 0 stays %08x for the indirect branches that reach this wrapper\n",
++            reboot_kp.offset, (void *)body, first);
++    return 0;
++}
++
+ void __init ksu_supercalls_init(void)
+ {
+     int rc;
+ 
+     ksu_supercall_dump_commands();
+ 
++#if defined(__aarch64__)
++    rc = ksu_reboot_probe_park();
++    if (rc) {
++        pr_err("reboot kprobe parked nowhere (rc %d) - not registered, the install-fd supercall stays off this boot\n", rc);
++        return;
++    }
++#endif
+     rc = register_kprobe(&reboot_kp);
+     if (rc) {
+         pr_err("reboot kprobe failed: %d\n", rc);
 diff --git a/kernel/hook/arm64/syscall_hook.c b/kernel/hook/arm64/syscall_hook.c
 index f8d052c3..81e76c32 100644
 --- a/kernel/hook/arm64/syscall_hook.c

@@ -4,15 +4,12 @@
     {
       "flavor": "kernelsu",
       "kmis": [
-        "android12-5.10",
-        "android13-5.15",
-        "android14-6.1",
-        "android15-6.6"
+        "android13-5.15"
       ],
       "daemon": {
-        "url": "https://raw.githubusercontent.com/rushiranpise/Root-My-Galaxy-Payloads/main/kernelsu/ksud-generic-kdp",
-        "size": 5566824,
-        "sha256": "3487bde89b33043bd6aa09db68d21a6375aaa126e131fda53b6f6318327b0081",
+        "url": "https://raw.githubusercontent.com/lion24/Root-My-Galaxy-Payloads/main/kernelsu/ksud-generic-kdp",
+        "size": 5165704,
+        "sha256": "bfde647a4d1b18dd79cbbf2cf8cea125355189d9ef7507736b29a8aa86c0a8eb",
         "version": "3.3.1"
       }
     },

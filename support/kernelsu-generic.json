@@ -31,15 +31,12 @@
     {
       "flavor": "kernelsu-next",
       "kmis": [
-        "android12-5.10",
-        "android13-5.15",
-        "android14-6.1",
-        "android15-6.6"
+        "android13-5.15"
       ],
       "daemon": {
-        "url": "https://raw.githubusercontent.com/rushiranpise/Root-My-Galaxy-Payloads/main/kernelsu/ksud-next-generic-kdp",
-        "size": 4717248,
-        "sha256": "679504dd4e104dc1a296ed4ec795b5a5f3e808c2bd345a7ecfa201b40f1dca1d",
+        "url": "https://raw.githubusercontent.com/lion24/Root-My-Galaxy-Payloads/load-test-vendor-sm918b/kernelsu/ksud-next-generic-kdp",
+        "size": 4302488,
+        "sha256": "b5dccc21f542439facea03e74c1f1c1e7d5f6053787037304d5942203c16d32e",
         "version": "3.4.2"
       }
     },
